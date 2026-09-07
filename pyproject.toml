@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py3nes"
+version = "0.1.0"
+description = "Describe small NES games in Python and compile them to 6502 assembly and NROM ROMs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = ["nes", "6502", "gamedev", "code-generation"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Games/Entertainment",
+    "Topic :: Software Development :: Code Generators",
+]
+
+[project.optional-dependencies]
+test = ["py65>=1.2.0,<2"]
+
+[project.scripts]
+py3nes = "py3nes.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["py3nes*"]
