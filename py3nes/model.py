@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, IntFlag
-from typing import Union
+from .ir import ActionSpec
 
 
 def integer(value: int, name: str, minimum: int, maximum: int) -> int:
@@ -66,6 +66,7 @@ class Map:
     tiles: tuple[tuple[int, ...], ...]
     column: int = 0
     row: int = 0
+    solid: tuple[tuple[bool, ...], ...] | None = None
 
     def __post_init__(self) -> None:
         rows = tuple(tuple(row) for row in self.tiles)
@@ -79,6 +80,13 @@ class Map:
             for tile in row:
                 integer(tile, "map tile", 0, 255)
         object.__setattr__(self, "tiles", rows)
+        if self.solid is not None:
+            mask = tuple(tuple(row) for row in self.solid)
+            if len(mask) != len(rows) or any(len(row) != len(rows[0]) for row in mask):
+                raise ValueError("collision grid must match the map dimensions")
+            if any(not isinstance(cell, bool) for row in mask for cell in row):
+                raise TypeError("collision grid cells must be bools")
+            object.__setattr__(self, "solid", mask)
 
     @property
     def width(self) -> int:
@@ -114,7 +122,7 @@ class TextBox:
 
 
 @dataclass(frozen=True)
-class Move:
+class Move(ActionSpec):
     """Add signed deltas to a sprite's OAM coordinates, wrapping modulo 256."""
 
     sprite: Sprite
@@ -128,7 +136,7 @@ class Move:
 
 
 @dataclass(frozen=True)
-class SetPosition:
+class SetPosition(ActionSpec):
     sprite: Sprite
     x: int
     y: int
@@ -140,7 +148,7 @@ class SetPosition:
 
 
 @dataclass(frozen=True)
-class SetTile:
+class SetTile(ActionSpec):
     sprite: Sprite
     tile: int
 
@@ -149,7 +157,7 @@ class SetTile:
         integer(self.tile, "tile", 0, 255)
 
 
-Action = Union[Move, SetPosition, SetTile]
+Action = ActionSpec
 
 
 def _sprite(value: Sprite) -> None:
@@ -170,8 +178,8 @@ class Event:
         if not actions:
             raise ValueError("an event needs at least one action")
         for action in actions:
-            if not isinstance(action, (Move, SetPosition, SetTile)):
-                raise TypeError("gameplay uses Move, SetPosition, or SetTile descriptions; Python callbacks run only at build time")
+            if not isinstance(action, ActionSpec):
+                raise TypeError("gameplay uses explicit action descriptions; Python callbacks run only at build time")
         if self.trigger is Trigger.FRAME:
             if self.button is not None:
                 raise ValueError("a frame event cannot have a button")

@@ -1,18 +1,21 @@
 """Public builder API. All Python code runs before the ROM is started."""
 
-from dataclasses import replace
+from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 import textwrap
 from typing import Sequence
 
 from .assets import DEFAULT_PALETTE, FONT_TILES, Tile, encode_text
 from .build import BuildResult, compile_rom, emit_assembly
-from .model import (Action, Button, Event, Map, Move, SetPosition, SetTile,
+from .model import (Action, Button, Event, Map, SetTile,
                     Sprite, TextBox, Trigger, integer)
+from .ir import Variable
+from .physics import Actor, Hitbox, Metasprite, SpritePart
+from .effects import SetBackgroundTile
 
 
 class Game:
-    """Build an NTSC, mapper-0 game with static backgrounds and sprite events."""
+    """Build an NTSC, mapper-0 game from assets, state, actors, and explicit rules."""
 
     def __init__(self, *, region: str = "NTSC", mapper: str = "NROM",
                  palette: Sequence[int] = DEFAULT_PALETTE) -> None:
@@ -36,6 +39,48 @@ class Game:
         self._events: list[Event] = []
         self._layers: list[Map] = []
         self._text_boxes: list[TextBox] = []
+        self._variables: list[Variable] = []
+        self._actors: list[Actor] = []
+        self._post_events: list[Event] = []
+        self._oam_used = 0
+
+    @property
+    def variables(self):
+        return tuple(self._variables)
+
+    @property
+    def actors(self):
+        return tuple(self._actors)
+
+    @property
+    def post_events(self):
+        return tuple(self._post_events)
+
+    def _variable(self, name, initial, kind):
+        variable = Variable(name, initial, kind)
+        if name.startswith(("actor_", "rt_")):
+            raise ValueError("variable prefixes actor_ and rt_ are reserved by the runtime")
+        if any(v.name == name for v in self._variables):
+            raise ValueError(f"duplicate variable name: {name}")
+        public = sum(not v.name.startswith("actor_") for v in self._variables)
+        if public >= 64:
+            raise ValueError("maximum 64 user variables per game")
+        self._variables.append(variable)
+        return variable
+
+    def byte(self, name: str, initial: int = 0) -> Variable:
+        """Allocate an unsigned byte in ROM runtime RAM, with modulo-256 arithmetic."""
+        return self._variable(name, initial, "u8")
+
+    variable = byte
+
+    def signed_byte(self, name: str, initial: int = 0) -> Variable:
+        """Allocate a two's-complement byte (-128..127), with signed comparisons."""
+        return self._variable(name, initial, "i8")
+
+    def flag(self, name: str, initial: bool = False) -> Variable:
+        """Allocate a Boolean flag. Set accepts 0/1, bool, or another flag."""
+        return self._variable(name, initial, "flag")
 
     @property
     def sprites(self) -> tuple[Sprite, ...]:
@@ -74,26 +119,86 @@ class Game:
                palette: int = 0, flip_horizontal: bool = False,
                flip_vertical: bool = False, behind_background: bool = False) -> Sprite:
         """Add one hardware sprite. Y uses the NES's raw OAM coordinate (screen y−1)."""
-        if len(self._sprites) == 64:
+        if self._oam_used == 64:
             raise ValueError("the NES supports at most 64 hardware sprites")
         # Validate all fields before registering graphics, so rejected calls do
         # not consume pattern-table slots or otherwise alter the description.
         index = 0 if isinstance(tile, Tile) else self._tile_index(tile)
-        result = Sprite(len(self._sprites), index, x, y, palette,
+        result = Sprite(self._oam_used, index, x, y, palette,
                         flip_horizontal, flip_vertical, behind_background)
         if isinstance(tile, Tile):
             result = replace(result, tile=self.tile(tile))
         self._sprites.append(result)
+        self._oam_used += 1
         return result
 
+    def metasprite(self, tiles, *, palette=0) -> Metasprite:
+        """Combine a rectangular grid of tiles into one larger actor graphic."""
+        rows = tuple(tuple(row) for row in tiles)
+        if not rows or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
+            raise ValueError("metasprite tiles must be a nonempty rectangular grid")
+        if len(rows) > 4 or len(rows[0]) > 4:
+            raise ValueError("metasprite grid must fit 4×4 tiles")
+        integer(palette, "sprite palette", 0, 3)
+        before = len(self._tiles)
+        try:
+            parts = tuple(SpritePart(self.tile(tile) if isinstance(tile, Tile) else self._tile_index(tile),
+                                     x * 8, y * 8, palette)
+                          for y, row in enumerate(rows) for x, tile in enumerate(row))
+            return Metasprite(parts)
+        except (TypeError, ValueError):
+            del self._tiles[before:]
+            raise
+
+    def actor(self, *, tile=None, frames=None, name=None, x=0, y=1,
+              hitbox=None, gravity=0, max_fall_speed=4, frame_ticks=8, collides=True) -> Actor:
+        """Create an actor with screen coordinates, velocity, collision and animation."""
+        if len(self._actors) >= 8:
+            raise ValueError("maximum 8 actors per game")
+        if (tile is None) == (frames is None):
+            raise ValueError("provide either tile or frames for an actor")
+        if name is None:
+            name = f"actor{len(self._actors)}"
+        if any(a.name == name for a in self._actors):
+            raise ValueError(f"duplicate actor name: {name}")
+        before = len(self._tiles)
+        try:
+            graphics = []
+            for graphic in ((tile,) if frames is None else frames):
+                if not isinstance(graphic, Metasprite):
+                    index = self.tile(graphic) if isinstance(graphic, Tile) else self._tile_index(graphic)
+                    graphic = Metasprite((SpritePart(index),))
+                for part in graphic.parts:
+                    self._tile_index(part.tile)
+                graphics.append(graphic)
+            if not graphics:
+                raise ValueError("actor needs at least one animation frame")
+            if hitbox is None:
+                hitbox = Hitbox(max(p.dx + 8 for g in graphics for p in g.parts),
+                                max(p.dy + 8 for g in graphics for p in g.parts))
+            actor = Actor(len(self._actors), name, tuple(graphics), self._oam_used,
+                          x, y, hitbox, gravity, max_fall_speed, frame_ticks, collides)
+            if self._oam_used + actor.oam_slots > 64:
+                raise ValueError("actors and sprites together may use at most 64 OAM slots")
+        except (TypeError, ValueError):
+            del self._tiles[before:]
+            raise
+        self._actors.append(actor)
+        self._variables.extend(actor.variables)
+        self._oam_used += actor.oam_slots
+        return actor
+
     def map(self, tiles: Map | Sequence[Sequence[int]], *,
-            column: int | None = None, row: int | None = None) -> Map:
+            column: int | None = None, row: int | None = None, solid=None) -> Map:
         """Place a tile rectangle. Later background calls overwrite earlier ones."""
         if isinstance(tiles, Map):
             result = replace(tiles, column=tiles.column if column is None else column,
                              row=tiles.row if row is None else row)
         else:
             result = Map(tiles, 0 if column is None else column, 0 if row is None else row)
+        if solid is not None:
+            mask = tuple((solid,) * result.width for _ in range(result.height)) if isinstance(solid, bool) else solid
+            result = replace(result, solid=mask)
         for line in result.tiles:
             for tile in line:
                 self._tile_index(tile)
@@ -167,13 +272,29 @@ class Game:
         """Register an explicit event and check that all targets belong to this game."""
         if not isinstance(event, Event):
             raise TypeError("event must be an Event description")
-        for action in event.actions:
-            if not any(action.sprite is sprite for sprite in self._sprites):
-                raise ValueError("action sprite belongs to a different game or was not registered")
-            if isinstance(action, SetTile):
-                self._tile_index(action.tile)
+        self._validate(event)
         self._events.append(event)
         return event
+
+    def _validate(self, value, depth=0):
+        """Validate every branch and nested expression, even currently false branches."""
+        if depth > 192:
+            raise ValueError("runtime description is nested too deeply (maximum 32 expression/action levels)")
+        if isinstance(value, Variable):
+            if not any(value is v for v in self._variables):
+                raise ValueError("variable belongs to a different game or was not registered")
+        elif isinstance(value, Actor):
+            if not any(value is a for a in self._actors):
+                raise ValueError("actor belongs to a different game or was not registered")
+        elif isinstance(value, Sprite):
+            if not any(value is s for s in self._sprites):
+                raise ValueError("action sprite belongs to a different game or was not registered")
+        elif is_dataclass(value):
+            if isinstance(value, (SetTile, SetBackgroundTile)):
+                self._tile_index(value.tile)
+            for field in fields(value): self._validate(getattr(value, field.name), depth + 1)
+        elif isinstance(value, (tuple, list)):
+            for item in value: self._validate(item, depth + 1)
 
     def bind_held(self, button: Button, *actions: Action) -> Event:
         """Run actions on each game tick while a button is held."""
@@ -186,6 +307,23 @@ class Game:
     def every_frame(self, *actions: Action) -> Event:
         """Run actions every game tick, in event registration order."""
         return self.add_event(Event(Trigger.FRAME, actions))
+
+    def after_physics(self, *actions: Action) -> Event:
+        """Evaluate gameplay rules after movement/collision, before rendering this tick."""
+        event = Event(Trigger.FRAME, actions)
+        self._validate(event)
+        self._post_events.append(event)
+        return event
+
+    def collision_data(self) -> bytes:
+        """Return a separate 32×30 grid of solid flags; graphics do not imply collision."""
+        collision = bytearray(960)
+        for layer in self._layers:
+            if layer.solid is not None:
+                for y, row in enumerate(layer.solid):
+                    start = (layer.row + y) * 32 + layer.column
+                    collision[start:start + len(row)] = bytes(row)
+        return bytes(collision)
 
     def nametable(self) -> bytes:
         """Return 960 background tile indices and 64 palette-zero attribute bytes."""
@@ -205,7 +343,9 @@ class Game:
         """Generate self-contained ca65 source without requiring installed build tools."""
         from .codegen import generate_assembly
         return generate_assembly(nametable=self.nametable(), chr_data=self.chr_data(),
-                                 palette=self.palette, sprites=self.sprites, events=self.events)
+                                 palette=self.palette, sprites=self.sprites, events=self.events,
+                                 variables=self.variables, actors=self.actors,
+                                 collision=self.collision_data(), post_events=self.post_events)
 
     def emit_assembly(self, path: str | Path) -> Path:
         """Write a .s (or .asm) file and sibling .cfg linker configuration."""

@@ -7,11 +7,12 @@ import sys
 
 from .build import BuildError
 from .game import Game
+from . import __version__
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Compile a Python Game description into an NES ROM")
-    parser.add_argument("--version", action="version", version="py3nes 0.1.0")
+    parser.add_argument("--version", action="version", version=f"py3nes {__version__}")
     parser.add_argument("script", type=Path, help="Python file exporting a variable named game")
     parser.add_argument("-o", "--output", type=Path, help="output .nes (or .s with --assembly-only)")
     parser.add_argument("--assembly-only", action="store_true", help="write assembly and linker config without running cc65")
