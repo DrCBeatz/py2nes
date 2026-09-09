@@ -14,9 +14,17 @@ def _lines(source):
 
 
 class PhysicsRuntime:
-    def __init__(self, compiler, actors, collision):
+    def __init__(self, compiler, actors, collision, rooms=()):
         self.compiler = compiler
         self.actors = tuple(actors)
+        self.rooms = tuple(rooms)
+        self._actor_rooms = {
+            id(actor): index
+            for index, room in enumerate(self.rooms)
+            for actor in room.actors
+        }
+        if self.rooms and any(id(actor) not in self._actor_rooms for actor in self.actors):
+            raise ValueError("every actor must belong to a named room")
         if len(collision) != 960:
             raise ValueError("collision grid must contain exactly 960 bytes")
         self.collision = bytes(bool(value) for value in collision)
@@ -36,16 +44,37 @@ class PhysicsRuntime:
             if label != "phys_" + name:
                 raise ValueError("compiler.reserve must preserve physics scratch labels")
         compiler.reserve("phys_ptr", size=2, zp=True)
+        if self.rooms:
+            # The room loader changes this pointer while rendering is disabled.
+            compiler.reserve("phys_collision_base", size=2, zp=True)
         self.init = ["    jsr physics_initial_ground", "    jsr render_actors_initial"]
         self.update = ["    jsr physics_update"]
         self.render = ["    jsr render_actors"]
         self.routines = self._dispatch() + self._common() + self._render()
-        self.rodata = ["physics_collision:"]
+        if self.rooms:
+            for index, room in enumerate(self.rooms):
+                collision = room.collision_data()
+                if len(collision) != 960:
+                    raise ValueError("collision grid must contain exactly 960 bytes")
+                self._collision_table(f"room_{index}_collision", collision)
+        else:
+            self._collision_table("physics_collision", self.collision)
+            for suffix, operator in (("lo", "<"), ("hi", ">")):
+                self.rodata.extend([f"physics_rows_{suffix}:",
+                    "    .byte " + ", ".join(f"{operator}(physics_collision + {row * 32})" for row in range(30))])
+
+    def _collision_table(self, label, collision):
+        self.rodata.append(f"{label}:")
         for offset in range(0, 960, 32):
-            self.rodata.append("    .byte " + ", ".join(str(v) for v in self.collision[offset:offset + 32]))
-        for suffix, operator in (("lo", "<"), ("hi", ">")):
-            self.rodata.extend([f"physics_rows_{suffix}:",
-                "    .byte " + ", ".join(f"{operator}(physics_collision + {row * 32})" for row in range(30))])
+            self.rodata.append("    .byte " + ", ".join(str(int(bool(v))) for v in collision[offset:offset + 32]))
+
+    def _active_room(self, actor, skip):
+        """Skip an inactive room with an absolute jump, even for large actors."""
+        if not self.rooms:
+            return []
+        active = self.compiler.unique("actor_room_active")
+        return ["    lda rt_room", f"    cmp #{self._actor_rooms[id(actor)]}",
+                f"    beq {active}", f"    jmp {skip}", f"{active}:"]
 
     def _var(self, actor, key):
         if not any(actor is candidate for candidate in self.actors):
@@ -69,6 +98,7 @@ class PhysicsRuntime:
         for actor in self.actors:
             skip = self.compiler.unique("physics_actor_skip")
             active = self.compiler.unique("physics_actor_active")
+            lines += self._active_room(actor, skip)
             lines += [f"    lda {self._var(actor, 'visible')}", f"    bne {active}",
                       f"    jmp {skip}", f"{active}:"]
             lines += self._state_in(actor) + ["    jsr physics_tick"]
@@ -77,8 +107,12 @@ class PhysicsRuntime:
             lines += [f"{skip}:"]
         lines += ["    rts", "physics_initial_ground:"]
         for actor in self.actors:
+            skip = self.compiler.unique("physics_ground_skip") if self.rooms else None
+            lines += self._active_room(actor, skip)
             lines += self._state_in(actor) + ["    jsr physics_support", "    lda phys_grounded",
                                               f"    sta {self._var(actor, 'grounded')}"]
+            if skip is not None:
+                lines += [f"{skip}:"]
         return lines + ["    rts"]
 
     def emit_action(self, action):
@@ -113,6 +147,8 @@ class PhysicsRuntime:
             return None
         lines = []
         for actor in (condition.first, condition.second):
+            self._var(actor, "visible")
+            lines += self._active_room(actor, false_label)
             visible = self.compiler.unique("overlap_visible")
             lines += [f"    lda {self._var(actor, 'visible')}", f"    bne {visible}",
                       f"    jmp {false_label}", f"{visible}:"]
@@ -139,6 +175,7 @@ class PhysicsRuntime:
             if len(actor.frames) == 1:
                 continue
             skip = self.compiler.unique("animation_skip")
+            lines += self._active_room(actor, skip)
             lines += [f"    lda {self._var(actor, 'visible')}", f"    beq {skip}",
                       f"    lda {self._var(actor, 'animation_enabled')}", f"    beq {skip}",
                       f"    inc {self._var(actor, 'frame_timer')}",
@@ -151,6 +188,8 @@ class PhysicsRuntime:
         for actor in self.actors:
             end = self.compiler.unique("render_actor_end")
             visible = self.compiler.unique("render_actor_visible")
+            # Rooms reuse OAM slots. An inactive actor must not even hide them.
+            lines += self._active_room(actor, end)
             lines += ["    lda #$FF"]
             for i in range(actor.oam_slots):
                 lines += [f"    sta ${0x200 + (actor.oam_start + i) * 4:04X}"]
@@ -181,9 +220,8 @@ class PhysicsRuntime:
             lines += [f"{end}:"]
         return lines + ["    rts"]
 
-    @staticmethod
-    def _common():
-        return _lines('''
+    def _common(self):
+        source = '''
             ; Signed velocities are saturated to -8..8 pixels per tick.
             physics_clamp_velocity:
                 cmp #$80
@@ -413,4 +451,28 @@ class PhysicsRuntime:
             physics_collision_hit:
                 lda #1
                 rts
-        ''')
+        '''
+        if self.rooms:
+            source = source.replace('''                ldx phys_row
+                lda physics_rows_lo,x
+                sta phys_ptr
+                lda physics_rows_hi,x
+                sta phys_ptr+1''', '''                ; Full 16-bit base + row * 32, including page carries.
+                lda phys_row
+                lsr a
+                lsr a
+                lsr a
+                sta phys_ptr+1
+                lda phys_row
+                asl a
+                asl a
+                asl a
+                asl a
+                asl a
+                clc
+                adc phys_collision_base
+                sta phys_ptr
+                lda phys_ptr+1
+                adc phys_collision_base+1
+                sta phys_ptr+1''')
+        return _lines(source)

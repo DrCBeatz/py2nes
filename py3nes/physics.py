@@ -84,7 +84,7 @@ class Actor:
     frame_timer: Variable = field(init=False)
 
     def __post_init__(self):
-        integer(self.index, "actor index", 0, 7)
+        integer(self.index, "actor index", 0, 127)
         if not isinstance(self.name, str) or not self.name.isidentifier() or not self.name.isascii():
             raise ValueError("actor name must be an ASCII identifier")
         frames = tuple(self.frames)

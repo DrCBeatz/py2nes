@@ -35,6 +35,18 @@ Collect all three keys, avoid the moving hazard, and reach the door. This exampl
 uses solid platforms, a 16×16 animated character, changing counters, win/lose
 messages, and sound effects. The existing demos and their raw-sprite API still work.
 
+For an adventure spanning several screens, run:
+
+```sh
+python examples/three_rooms.py
+```
+
+Open `build/three_rooms.nes`. Left/right moves, A jumps, and **Up enters a door**.
+Visit the garden on the left, jump onto its ledge to collect the key, return to
+the hall, and unlock the tower on the right. Press Up at the tower's final exit
+to win. Start begins a new game. Revisiting the garden demonstrates that the
+collected key stays gone while the player resets to the room's entrance.
+
 ```python
 from py3nes import Button, Game, Move, Tile
 
@@ -156,8 +168,9 @@ Use the comparison methods rather than Python's `==` or `!=`, which also raise
 an error so a rule cannot accidentally become a build-time constant.
 
 Names start with an ASCII letter, use letters/digits/underscores, and are unique
-within the game. Prefixes `actor_` and `rt_` are reserved. Up to 64 user variables
-are supported; each uses one byte of RAM. Actor state is allocated separately.
+within their game or room scope. Prefixes `actor_`, `room_`, and `rt_` are reserved.
+Up to 64 user variables across all scopes are supported; each uses one byte of
+RAM. Actor state is allocated separately.
 Generated labels are `v_<name>`, allowing inspection in an emulator debugger.
 Every branch is validated for references to variables and actors from this game.
 
@@ -272,8 +285,8 @@ Each actor reserves enough OAM slots for its largest frame and hides unused slot
 Animation loops every `frame_ticks` gameplay ticks. `Set(hero.frame, 0)` selects
 a frame; `Animate(hero, False)` holds it. The default hitbox covers the graphics.
 
-There are at most 8 actors and 64 hardware sprite slots shared with legacy
-sprites. A 16×16 character consumes four slots, and the NES's eight sprites per
+There are at most 8 actors and 64 hardware sprite slots per room, shared with
+legacy sprites. A 16×16 character consumes four slots, and the NES's eight sprites per
 scanline limit still applies. Automatic sprite flicker is not implemented.
 
 `Tone(frequency=440, frames=8, volume=10, duty=2)` describes a constant-volume
@@ -283,6 +296,109 @@ sound on pulse channel 1; `StopSound()` silences it. Sound commands commit at th
 next ready frame, and durations advance every video frame even if graphics or
 physics delay gameplay. There is no music sequencer or multi-channel mixer yet.
 The implementation follows NESdev's [pulse-channel register reference](https://www.nesdev.org/wiki/APU_Pulse).
+
+## 5. Rooms, entrances, and state lifetime
+
+Create named rooms with `game.room("name")`. Each room provides `text`, `text_box`,
+`map`, `sprite`, `actor`, button bindings, `every_frame`, and `after_physics`.
+Backgrounds, collision, actor placements, and local rules belong to that room.
+Register shared graphics with `game.tile`/`game.metasprite`; the same methods on
+a room use the game's shared tile collection. All rooms share the cartridge
+palette. Build the containing `game`, rather than an individual room.
+
+```python
+from py3nes import (Button, ChangeRoom, Game, Hide, If, Overlaps,
+                    Set, WriteNumber)
+
+game = Game()
+keys = game.byte("keys")
+hall = game.room("hall")
+garden = game.room("garden")
+hall_player = hall.actor(tile=1, name="player", x=40, y=100)
+garden_player = garden.actor(tile=1, name="player", x=40, y=100)
+key = garden.actor(tile=2, name="key", x=80, y=100, collides=False)
+key_taken = garden.flag("key_taken", persistent=True)
+
+hall.spawn("start", hall_player, x=120, y=100)
+hall.spawn("from_garden", hall_player, x=40, y=100)
+garden.spawn("entrance", garden_player, x=40, y=100)
+game.start(hall, spawn="start")
+
+# These minimal bindings switch rooms anywhere. The complete example wraps
+# ChangeRoom in If(Overlaps(player, door), ...) to require being at a door.
+hall.bind_pressed(Button.UP, ChangeRoom(garden, spawn="entrance"))
+garden.bind_pressed(Button.UP, ChangeRoom(hall, spawn="from_garden"))
+garden.after_physics(If(~key_taken & Overlaps(garden_player, key),
+                       Set(key_taken, True), Set(keys, 1), Hide(key)))
+garden.on_enter(If(key_taken, Hide(key)), WriteNumber(keys, 2, 2, digits=1))
+
+# A global rule works in every room. Reset persistent state explicitly.
+game.bind_pressed(Button.START, Set(keys, 0), Set(key_taken, False),
+                  ChangeRoom(hall, spawn="start"))
+```
+
+Room and spawn names are ASCII identifiers; room names are unique within the
+game, and spawn names within a room. A spawn names one actor's position in screen
+pixels. It must reference that room's actor and fit the actor's bounds. Spawn
+names can be declared after their `ChangeRoom` rules; compilation checks that
+every referenced spawn exists. Without `spawn=...`, actors use their original
+placements. The first room is the default starting room; `game.start(...)`
+selects another room or a named initial entrance.
+
+State lifetime is explicit:
+
+| Description | On room entry | Accessible from |
+| --- | --- | --- |
+| `game.byte`, `game.flag`, `game.signed_byte` | Keeps its current value | All rooms and global rules |
+| `room.byte`/`flag`/`signed_byte` | Resets to its declared initial value | Its own room |
+| The same room methods with `persistent=True` | Keeps its current value | All rooms and global rules |
+| Actor state and raw sprite data | Resets to original values | Its own room |
+
+Persistence means **across room transitions during the current run**. There is
+no battery-backed save or automatic new-game operation. Power/reset initializes
+all state; a Start binding resets only the values its actions explicitly change.
+Persistent room state is accessible elsewhere so a restart can clear collected
+item flags. Temporary room variables, actors, and sprites cannot be referenced
+from another room or global rules. Use a global inventory variable and separate
+player placements per room.
+
+On entry, the runtime resets temporary variables and actor state, applies the
+chosen spawn, evaluates `on_enter` actions in registration order, then establishes
+grounded state and renders the actors. `on_enter` also runs for the initial room.
+Use it to hide previously collected items and restore messages from persistent
+state: ordinary background edits are rebuilt from the room's description on
+every entry. `on_enter` cannot contain another `ChangeRoom`, including inside an
+`If`. Entering the current room again performs the same reset/load sequence.
+
+Global controller/frame events run before the active room's events, followed by
+its physics, global `after_physics` rules, and the room's `after_physics` rules.
+The first executed `ChangeRoom` immediately ends that gameplay tick; remaining
+actions and rules do not run, and pending source-room display updates are
+discarded. Controller history survives entry, so a held button does not become
+a second `bind_pressed` event in the destination.
+Transitions also stop the previous room's sound effect and discard its pending
+sound request. An `on_enter` sound starts with the next normal display commit.
+
+Transitions briefly disable rendering, load the destination background and
+collision selection, apply its entry actions, and transfer a complete sprite
+list before showing the room. Entry display writes finish while the screen is
+blank. The 64-write validation limit applies separately to each room's entry
+actions and each possible active-room gameplay tick, including global rules.
+This is a full-screen transition; it does not scroll between adjacent rooms.
+The screen upload follows the NES PPU's allowance for VRAM writes with
+[rendering disabled](https://www.nesdev.org/wiki/PPU_programmer_reference).
+
+The current limit is 16 named rooms, 8 actors/64 hardware sprite slots per room,
+and 64 user variables total. Actual capacity also depends on ROM and RAM usage;
+the compiler/linker report exhaustion. Actor state for all rooms is allocated in
+RAM, while OAM slots are reused by the active room. Debug labels for room variables
+are `v_room_<room_index>_<name>`; actor labels use a unique numeric actor index.
+The byte `rt_room` reports the active room index.
+
+Existing games without named rooms keep their original API and ROM layout.
+With named rooms, place visual content and actors on the rooms; mixing root
+`game.text`/`map`/`actor`/`sprite` content with named rooms raises an error.
+Root variables and global event rules remain useful in a room-based game.
 
 ## Assembly and command-line builds
 
@@ -313,10 +429,12 @@ programs, including any top-level side effects.
 
 ## ROM layout and runtime
 
-The compiler emits NTSC NROM-128: a 16-byte iNES header, 16 KiB of PRG ROM
-mapped at `$C000` (mirrored at `$8000`), and 8 KiB of CHR ROM. Both pattern tables
-contain the same 256 tiles. Nametable mirroring is horizontal. Unsupported
-regions and mappers are rejected. The linker reports PRG overflow.
+The compiler emits NTSC mapper-0 cartridges with a 16-byte iNES header and
+8 KiB of CHR ROM. Games without named rooms use NROM-128: 16 KiB of PRG ROM mapped
+at `$C000`, mirrored at `$8000`. Named-room games use NROM-256: 32 KiB of PRG ROM
+mapped at `$8000–$FFFF`. Both pattern tables contain the same 256 tiles.
+Nametable mirroring is horizontal. Unsupported regions and mappers are rejected.
+The linker reports PRG overflow.
 
 Reset disables audio/IRQs, waits for PPU initialization, clears RAM, uploads the
 palette and static nametable, and initializes all 64 sprite slots. Unused sprites
@@ -334,8 +452,9 @@ linker map reports actual code/data use. Stack, OAM, work RAM, and zero-page
 allocations are kept separate. The compiler rejects RAM exhaustion and excessive
 expression/condition depth, and ld65 rejects ROM overflow.
 
-Hardware constraints remain visible: 64 sprites total, at most eight per scanline,
-one screen with mutable background tiles, and no scrolling or bank switching. Hardware setup
+Hardware constraints remain visible: 64 sprites on the active screen, at most
+eight per scanline, one displayed room with mutable background tiles, and no
+scrolling or bank switching. Hardware setup
 and input behavior are based on NESdev's
 [PPU initialization](https://www.nesdev.org/wiki/PPU_power_up_state),
 [PPU registers](https://www.nesdev.org/wiki/PPU_registers), and
@@ -353,7 +472,8 @@ The tests check description validation and graphics encoding, compile ROMs with
 cc65, and execute their real 6502 instructions using py65 with a small mocked NES
 bus. They exercise reset uploads, controller edge detection, typed state and
 branches, collision and animation, OAM DMA, display queues, decimal conversion,
-sound timing, and NMI register preservation. Compiler/emulation tests skip if cc65
+sound timing, room transitions and state lifetime, and NMI register preservation.
+Compiler/emulation tests skip if cc65
 or py65 is unavailable. This bus is not a cycle-accurate PPU emulator; see
 `tools/emulator_smoke.mjs` for a separate full-emulator smoke check using JSNES:
 
@@ -363,11 +483,16 @@ python examples/hello_nes.py
 node tools/emulator_smoke.mjs
 python examples/keys_and_platforms.py
 node tools/platformer_smoke.mjs
+python examples/three_rooms.py
+node tools/rooms_smoke.mjs
 ```
 
 This checks rendered text and controller behavior, then saves initial and moved
 frames beside the demo ROM as PNG files. The platformer check plays through the
 level with controller inputs and verifies collection, victory, and restart.
+The rooms check tries the locked tower, collects the garden key, revisits the
+garden to verify persistence, wins in the tower, and starts a new game. It saves
+screenshots of the hall, collected key, unlocked hall, and victory.
 Node is needed only for these extra checks.
 
 Licensed under MIT. The bundled font and example graphics are original.

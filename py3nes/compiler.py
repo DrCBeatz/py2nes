@@ -6,8 +6,9 @@ from .ir import Add, Binary, Compare, Constant, If, Logical, Set, Variable, as_e
 
 
 class RuntimeCompiler:
-    def __init__(self, variables=(), actors=(), collision=bytes(960), events=(), post_events=()):
+    def __init__(self, variables=(), actors=(), collision=bytes(960), events=(), post_events=(), rooms=()):
         self.variables = tuple(variables)
+        self.rooms = tuple(rooms)
         self._names = {}
         self._symbols = set()
         self._sequence = 0
@@ -19,23 +20,34 @@ class RuntimeCompiler:
         self.physics = None
         self.effects = None
         self.expr_rhs = self.reserve("rt_expr_rhs", zp=True)
+        if self.rooms:
+            for name in ("room", "room_next", "room_spawn", "room_pending", "room_loading"):
+                self.reserve("rt_" + name)
         for variable in self.variables:
             label = self.reserve("v_" + variable.name)
             self._names[id(variable)] = label
             self.init += [f"    lda #${variable.initial & 255:02X}", f"    sta {label}"]
         if actors:
             from .physics_codegen import PhysicsRuntime
-            self.physics = PhysicsRuntime(self, actors, collision)
-            self.init += self.physics.init
-        actions = tuple(walk_actions(a for event in (*events, *post_events) for a in event.actions))
+            self.physics = PhysicsRuntime(self, actors, collision, rooms=self.rooms)
+            if not self.rooms:
+                self.init += self.physics.init
+        room_events = tuple(e for room in self.rooms
+                            for e in (*room.events, *room.post_events, *room.enter_events))
+        actions = tuple(walk_actions(a for event in (*events, *post_events, *room_events) for a in event.actions))
         # Keep the state-only compiler independently usable as the runtime grows.
         from .effects import write_count
         from .effects_codegen import EffectsRuntime
         self.effects = EffectsRuntime(self, actions)
         self.init += self.effects.init
-        cost = sum(self.action_costs(event.actions, write_count) for event in (*events, *post_events))
-        if cost > 64:
-            raise ValueError(f"events may enqueue {cost} background tile writes per tick; maximum is 64 (split work across ticks)")
+        global_cost = sum(self.action_costs(event.actions, write_count) for event in (*events, *post_events))
+        costs = [global_cost]
+        for room in self.rooms:
+            costs.append(global_cost + sum(self.action_costs(e.actions, write_count)
+                                          for e in (*room.events, *room.post_events)))
+            costs.append(sum(self.action_costs(e.actions, write_count) for e in room.enter_events))
+        if max(costs) > 64:
+            raise ValueError(f"events may enqueue {max(costs)} background tile writes per tick or room entry; maximum is 64 (split work across ticks)")
 
     @staticmethod
     def action_costs(actions, leaf_cost):
@@ -127,6 +139,16 @@ class RuntimeCompiler:
     def action(self, action, depth=0):
         if depth > 32:
             raise ValueError("conditional actions may nest at most 32 levels")
+        from .rooms import ChangeRoom
+        if isinstance(action, ChangeRoom):
+            if not any(action.room is room for room in self.rooms):
+                raise ValueError("room belongs to another game or was not registered")
+            spawn = 255 if action.spawn is None else tuple(action.room.spawns).index(action.spawn)
+            # Event bodies are subroutines; an early RTS also exits nested Ifs.
+            # The main loop checks pending before running physics or more rules.
+            return [f"    lda #{action.room.index}", "    sta rt_room_next",
+                    f"    lda #{spawn}", "    sta rt_room_spawn",
+                    "    lda #1", "    sta rt_room_pending", "    rts"]
         if isinstance(action, Set):
             return self.load(action.value) + [f"    sta {self.var(action.variable)}"]
         if isinstance(action, Add):

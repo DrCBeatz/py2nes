@@ -60,8 +60,10 @@ def compile_rom(source: str, config: str, output: str | Path, *,
                 diagnostic = (process.stderr + process.stdout).strip()
                 raise BuildError(f"{command[0]} failed (exit {process.returncode}):\n{diagnostic}\nGenerated assembly: {assembly}")
         data = binary.read_bytes()
-        if len(data) != 16 + 16384 + 8192 or data[:6] != b"NES\x1a\x01\x01":
-            raise BuildError("Linker produced an invalid NROM-128 image")
+        if (len(data) < 16 or data[:4] != b"NES\x1a" or data[4] not in (1, 2)
+                or data[5] != 1 or data[6:16] != bytes(10)
+                or len(data) != 16 + data[4] * 16384 + 8192):
+            raise BuildError("Linker produced an invalid NROM image (16/32 KiB PRG, 8 KiB CHR)")
         map_file.replace(result.map_path)
         labels.replace(result.labels_path)
         binary.replace(rom)

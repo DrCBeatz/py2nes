@@ -43,6 +43,38 @@ class Game:
         self._actors: list[Actor] = []
         self._post_events: list[Event] = []
         self._oam_used = 0
+        self._rooms = []
+        self._start_room = None
+        self._start_spawn = None
+
+    @property
+    def rooms(self):
+        """Named rooms in their registration order."""
+        return tuple(self._rooms)
+
+    def room(self, name: str):
+        """Create an independently populated screen; graphics are shared by all rooms."""
+        from .rooms import Room
+        if any(room.name == name for room in self._rooms):
+            raise ValueError(f"duplicate room name: {name}")
+        if len(self._rooms) >= 16:
+            raise ValueError("maximum 16 rooms per game; ROM and RAM budgets also apply")
+        result = Room(self, name, len(self._rooms))
+        self._rooms.append(result)
+        return result
+
+    def start(self, room, *, spawn: str | None = None):
+        """Choose the initial room and optional entrance (defaults to the first room)."""
+        from .rooms import ChangeRoom
+        destination = ChangeRoom(room, spawn)
+        self._validate(destination)
+        self._start_room = room
+        self._start_spawn = spawn
+        return room
+
+    @property
+    def _root(self):
+        return self
 
     @property
     def variables(self):
@@ -58,11 +90,12 @@ class Game:
 
     def _variable(self, name, initial, kind):
         variable = Variable(name, initial, kind)
-        if name.startswith(("actor_", "rt_")):
-            raise ValueError("variable prefixes actor_ and rt_ are reserved by the runtime")
+        if name.startswith(("actor_", "rt_", "room_")):
+            raise ValueError("variable prefixes actor_, room_, and rt_ are reserved by the runtime")
         if any(v.name == name for v in self._variables):
             raise ValueError(f"duplicate variable name: {name}")
-        public = sum(not v.name.startswith("actor_") for v in self._variables)
+        public = sum(not v.name.startswith("actor_")
+                     for scope in (self._root,) + self._root.rooms for v in scope.variables)
         if public >= 64:
             raise ValueError("maximum 64 user variables per game")
         self._variables.append(variable)
@@ -154,7 +187,7 @@ class Game:
               hitbox=None, gravity=0, max_fall_speed=4, frame_ticks=8, collides=True) -> Actor:
         """Create an actor with screen coordinates, velocity, collision and animation."""
         if len(self._actors) >= 8:
-            raise ValueError("maximum 8 actors per game")
+            raise ValueError("maximum 8 actors per room" if self is not self._root else "maximum 8 actors per game")
         if (tile is None) == (frames is None):
             raise ValueError("provide either tile or frames for an actor")
         if name is None:
@@ -176,7 +209,7 @@ class Game:
             if hitbox is None:
                 hitbox = Hitbox(max(p.dx + 8 for g in graphics for p in g.parts),
                                 max(p.dy + 8 for g in graphics for p in g.parts))
-            actor = Actor(len(self._actors), name, tuple(graphics), self._oam_used,
+            actor = Actor(self._actor_index(), name, tuple(graphics), self._oam_used,
                           x, y, hitbox, gravity, max_fall_speed, frame_ticks, collides)
             if self._oam_used + actor.oam_slots > 64:
                 raise ValueError("actors and sprites together may use at most 64 OAM slots")
@@ -187,6 +220,9 @@ class Game:
         self._variables.extend(actor.variables)
         self._oam_used += actor.oam_slots
         return actor
+
+    def _actor_index(self):
+        return len(self._actors)
 
     def map(self, tiles: Map | Sequence[Sequence[int]], *,
             column: int | None = None, row: int | None = None, solid=None) -> Map:
@@ -278,17 +314,23 @@ class Game:
 
     def _validate(self, value, depth=0):
         """Validate every branch and nested expression, even currently false branches."""
+        from .rooms import ChangeRoom
         if depth > 192:
             raise ValueError("runtime description is nested too deeply (maximum 32 expression/action levels)")
-        if isinstance(value, Variable):
-            if not any(value is v for v in self._variables):
-                raise ValueError("variable belongs to a different game or was not registered")
+        if isinstance(value, ChangeRoom):
+            if value.room.parent is not self._root or not any(value.room is room for room in self._root.rooms):
+                raise ValueError("ChangeRoom destination belongs to a different game or was not registered")
+        elif isinstance(value, Variable):
+            allowed = self._variables if self is self._root else self._variables + self._root._variables
+            allowed = allowed + [variable for room in self._root.rooms for variable in room.persistent_variables]
+            if not any(value is v for v in allowed):
+                raise ValueError("variable belongs to a different game/room or was not registered")
         elif isinstance(value, Actor):
             if not any(value is a for a in self._actors):
-                raise ValueError("actor belongs to a different game or was not registered")
+                raise ValueError("actor belongs to a different game/room or was not registered")
         elif isinstance(value, Sprite):
             if not any(value is s for s in self._sprites):
-                raise ValueError("action sprite belongs to a different game or was not registered")
+                raise ValueError("action sprite belongs to a different game/room or was not registered")
         elif is_dataclass(value):
             if isinstance(value, (SetTile, SetBackgroundTile)):
                 self._tile_index(value.tile)
@@ -342,17 +384,45 @@ class Game:
     def to_assembly(self) -> str:
         """Generate self-contained ca65 source without requiring installed build tools."""
         from .codegen import generate_assembly
+        self._validate_rooms()
+        room_options = {}
+        if self.rooms:
+            room_options = dict(rooms=self.rooms,
+                                start_room=(self._start_room or self.rooms[0]).index,
+                                start_spawn=self._start_spawn)
         return generate_assembly(nametable=self.nametable(), chr_data=self.chr_data(),
                                  palette=self.palette, sprites=self.sprites, events=self.events,
-                                 variables=self.variables, actors=self.actors,
-                                 collision=self.collision_data(), post_events=self.post_events)
+                                 variables=self.variables + tuple(v for room in self.rooms for v in room.variables),
+                                 actors=self.actors, collision=self.collision_data(),
+                                 post_events=self.post_events, **room_options)
+
+    def _validate_rooms(self):
+        from .ir import walk_actions
+        from .rooms import ChangeRoom
+        if self.rooms and (self.maps or self.sprites or self.actors):
+            raise ValueError("named rooms cannot be mixed with game-level maps, text, sprites, or actors; add them to a room")
+        if self._start_room is not None:
+            self._validate(ChangeRoom(self._start_room, self._start_spawn))
+            self._validate_spawn(self._start_room, self._start_spawn)
+        for scope in (self,) + self.rooms:
+            for event in scope.events + scope.post_events + getattr(scope, "enter_events", ()):
+                scope._validate(event)
+                for action in walk_actions(event.actions):
+                    if isinstance(action, ChangeRoom):
+                        self._validate_spawn(action.room, action.spawn)
+
+    @staticmethod
+    def _validate_spawn(room, name):
+        if name is not None and name not in room.spawns:
+            raise ValueError(f"room {room.name!r} has no spawn named {name!r}")
 
     def emit_assembly(self, path: str | Path) -> Path:
         """Write a .s (or .asm) file and sibling .cfg linker configuration."""
-        from .codegen import LINKER_CONFIG
-        return emit_assembly(self.to_assembly(), LINKER_CONFIG, path)
+        from .codegen import LINKER_CONFIG, ROOM_LINKER_CONFIG
+        return emit_assembly(self.to_assembly(), ROOM_LINKER_CONFIG if self.rooms else LINKER_CONFIG, path)
 
     def build(self, output: str | Path, *, ca65: str = "ca65", ld65: str = "ld65") -> BuildResult:
         """Generate assembly and invoke ca65/ld65 to produce a .nes cartridge image."""
-        from .codegen import LINKER_CONFIG
-        return compile_rom(self.to_assembly(), LINKER_CONFIG, output, ca65=ca65, ld65=ld65)
+        from .codegen import LINKER_CONFIG, ROOM_LINKER_CONFIG
+        return compile_rom(self.to_assembly(), ROOM_LINKER_CONFIG if self.rooms else LINKER_CONFIG,
+                           output, ca65=ca65, ld65=ld65)

@@ -8,12 +8,13 @@ Tests explicitly deliver NMIs and inspect the resulting CPU, PPU, and OAM data.
 
 class NESBus:
     def __init__(self, rom: bytes):
-        if rom[:4] != b"NES\x1a" or rom[4:6] != bytes((1, 1)):
-            raise ValueError("Tests require an iNES NROM-128 ROM with CHR ROM")
+        if len(rom) < 16 or rom[:4] != b"NES\x1a" or rom[4] not in (1, 2) or rom[5] != 1:
+            raise ValueError("Tests require an iNES NROM ROM with CHR ROM")
         if rom[6] & 0xF4 or rom[7] & 0xF0:
             raise ValueError("Tests require mapper 0 without a trainer")
-        self.prg = rom[16 : 16 + 16384]
-        self.chr = rom[16 + 16384 : 16 + 16384 + 8192]
+        prg_size = rom[4] * 16384
+        self.prg = rom[16 : 16 + prg_size]
+        self.chr = rom[16 + prg_size : 16 + prg_size + 8192]
         self.vertical_mirroring = bool(rom[6] & 1)
         self.ram = bytearray(2048)
         self.ppu_memory = bytearray(16384)
@@ -77,7 +78,7 @@ class NESBus:
             self.controller_index += 1
             return value
         if address >= 0x8000:
-            return self.prg[(address - 0x8000) % 16384]
+            return self.prg[(address - 0x8000) % len(self.prg)]
         return 0
 
     def __setitem__(self, address, value):
