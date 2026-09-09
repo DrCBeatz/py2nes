@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "py3nes"
-version = "0.3.0"
+version = "0.4.0"
 description = "Describe small NES games in Python and compile them to 6502 assembly and NROM ROMs."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,7 +17,8 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["py65>=1.2.0,<2"]
+images = ["Pillow>=10,<13"]
+test = ["py65>=1.2.0,<2", "Pillow>=10,<13"]
 
 [project.scripts]
 py3nes = "py3nes.__main__:main"

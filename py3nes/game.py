@@ -184,7 +184,8 @@ class Game:
             raise
 
     def actor(self, *, tile=None, frames=None, name=None, x=0, y=1,
-              hitbox=None, gravity=0, max_fall_speed=4, frame_ticks=8, collides=True) -> Actor:
+              hitbox=None, gravity=0, max_fall_speed=4, frame_ticks=8, collides=True,
+              subpixel=False) -> Actor:
         """Create an actor with screen coordinates, velocity, collision and animation."""
         if len(self._actors) >= 8:
             raise ValueError("maximum 8 actors per room" if self is not self._root else "maximum 8 actors per game")
@@ -210,7 +211,8 @@ class Game:
                 hitbox = Hitbox(max(p.dx + 8 for g in graphics for p in g.parts),
                                 max(p.dy + 8 for g in graphics for p in g.parts))
             actor = Actor(self._actor_index(), name, tuple(graphics), self._oam_used,
-                          x, y, hitbox, gravity, max_fall_speed, frame_ticks, collides)
+                          x, y, hitbox, gravity, max_fall_speed, frame_ticks, collides,
+                          subpixel=subpixel)
             if self._oam_used + actor.oam_slots > 64:
                 raise ValueError("actors and sprites together may use at most 64 OAM slots")
         except (TypeError, ValueError):
@@ -225,7 +227,7 @@ class Game:
         return len(self._actors)
 
     def map(self, tiles: Map | Sequence[Sequence[int]], *,
-            column: int | None = None, row: int | None = None, solid=None) -> Map:
+            column: int | None = None, row: int | None = None, solid=None, palette=None) -> Map:
         """Place a tile rectangle. Later background calls overwrite earlier ones."""
         if isinstance(tiles, Map):
             result = replace(tiles, column=tiles.column if column is None else column,
@@ -235,11 +237,20 @@ class Game:
         if solid is not None:
             mask = tuple((solid,) * result.width for _ in range(result.height)) if isinstance(solid, bool) else solid
             result = replace(result, solid=mask)
+        if palette is not None:
+            mask = (tuple((palette,) * result.width for _ in range(result.height))
+                    if isinstance(palette, int) else palette)
+            result = replace(result, palettes=mask)
         for line in result.tiles:
             for tile in line:
                 self._tile_index(tile)
         self._layers.append(result)
         return result
+
+    def platformer(self, actor, **options):
+        """Bind movement, acceleration, friction, buffered jumping and jump release."""
+        from .controls import platformer
+        return platformer(self, actor, **options)
 
     def text(self, text: str, *, column: int = 0, row: int = 0) -> TextBox:
         """Place uppercase text, with explicit newlines and no automatic wrapping."""
@@ -368,12 +379,26 @@ class Game:
         return bytes(collision)
 
     def nametable(self) -> bytes:
-        """Return 960 background tile indices and 64 palette-zero attribute bytes."""
+        """Return tile indices and packed palettes for 16×16 pixel regions."""
         table = bytearray(1024)
+        palettes = [None] * 960
         for layer in self._layers:
             for y, line in enumerate(layer.tiles):
                 start = (layer.row + y) * 32 + layer.column
                 table[start:start + layer.width] = bytes(line)
+                if layer.palettes is not None:
+                    palettes[start:start + layer.width] = layer.palettes[y]
+        for row in range(0, 30, 2):
+            for column in range(0, 32, 2):
+                choices = {palettes[(row + dy) * 32 + column + dx]
+                           for dy in range(2) for dx in range(2)} - {None}
+                if len(choices) > 1:
+                    raise ValueError(f"background palettes conflict in 16x16 region at tile ({column}, {row}); "
+                                     "all four tiles must share a palette")
+                palette = next(iter(choices), 0)
+                address = 960 + (row // 4) * 8 + column // 4
+                shift = ((row % 4) // 2) * 4 + ((column % 4) // 2) * 2
+                table[address] |= palette << shift
         return bytes(table)
 
     def chr_data(self) -> bytes:

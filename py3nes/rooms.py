@@ -171,6 +171,11 @@ Actor state always resets. Graphics and the cartridge palette belong to Game.
     def room(self, name: str):
         raise ValueError("rooms cannot contain rooms; call game.room()")
 
+    def import_tiled(self, path, *, colors=None, actor_factories=None):
+        """Load a finite Tiled JSON room, its collision, and named placements."""
+        from .tiled import load_tiled
+        return load_tiled(path, colors=colors).apply(self, actor_factories=actor_factories or {})
+
     def start(self, room, *, spawn: str | None = None):
         raise ValueError("choose the starting room with game.start()")
 

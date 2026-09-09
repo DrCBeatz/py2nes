@@ -61,12 +61,18 @@ class Sprite:
 
 @dataclass(frozen=True)
 class Map:
-    """A rectangular patch of background tile indices, placed in a 32×30 screen."""
+    """A rectangular background patch with optional collision and palette grids.
+
+    ``palettes`` assigns indexes 0–3 per tile. The compiler checks that final
+    assignments agree within each hardware-aligned 2×2-tile attribute quadrant.
+    ``None`` leaves palette selection to surrounding layers or default palette 0.
+    """
 
     tiles: tuple[tuple[int, ...], ...]
     column: int = 0
     row: int = 0
     solid: tuple[tuple[bool, ...], ...] | None = None
+    palettes: tuple[tuple[int, ...], ...] | None = None
 
     def __post_init__(self) -> None:
         rows = tuple(tuple(row) for row in self.tiles)
@@ -87,6 +93,14 @@ class Map:
             if any(not isinstance(cell, bool) for row in mask for cell in row):
                 raise TypeError("collision grid cells must be bools")
             object.__setattr__(self, "solid", mask)
+        if self.palettes is not None:
+            palettes = tuple(tuple(row) for row in self.palettes)
+            if len(palettes) != len(rows) or any(len(row) != len(rows[0]) for row in palettes):
+                raise ValueError("palette grid must match the map dimensions")
+            for row in palettes:
+                for palette in row:
+                    integer(palette, "map palette", 0, 3)
+            object.__setattr__(self, "palettes", palettes)
 
     @property
     def width(self) -> int:

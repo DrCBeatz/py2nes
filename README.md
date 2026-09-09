@@ -9,8 +9,9 @@ by the ROM, and Python source is not translated into 6502 instructions.
 
 ## Quick start
 
-Requires Python 3.10+ and [cc65](https://cc65.github.io/). The Python library has
-no runtime Python dependencies.
+Requires Python 3.10+ and [cc65](https://cc65.github.io/). The core Python library
+has no third-party dependencies; PNG and Tiled imports use the optional Pillow
+dependency installed with `pip install -e '.[images]'`.
 
 ```sh
 # macOS; on Debian/Ubuntu use: sudo apt install cc65
@@ -46,6 +47,21 @@ Visit the garden on the left, jump onto its ledge to collect the key, return to
 the hall, and unlock the tower on the right. Press Up at the tower's final exit
 to win. Start begins a new game. Revisiting the garden demonstrates that the
 collected key stays gone while the player resets to the room's entrance.
+
+For the same adventure built from editable PNG artwork and Tiled room maps:
+
+```sh
+python -m pip install -e '.[images]'
+python -m py3nes examples/visual_adventure.py -o build/visual_adventure.nes
+```
+
+Open `build/visual_adventure.nes` in your emulator. Edit the
+[PNG tilesheet](examples/assets/adventure/tiles.png) in a pixel-art editor or open
+[hall.tmj](examples/assets/adventure/hall.tmj),
+[garden.tmj](examples/assets/adventure/garden.tmj), and
+[tower.tmj](examples/assets/adventure/tower.tmj) in Tiled, then rerun the build.
+Controls and room goals follow the three-room adventure above. Gameplay rules
+remain in [visual_adventure.py](examples/visual_adventure.py).
 
 ```python
 from py3nes import Button, Game, Move, Tile
@@ -102,8 +118,9 @@ sprite at the right edge. These conventions follow the
 
 The first 64 tiles are the font; `CHAR_TO_TILE["A"]` gives a font tile index.
 There is room for up to 192 additional tiles. Bordered text boxes use six of
-those slots, shared across boxes. Backgrounds use palette 0. Sprites choose one
-of four sprite palettes. `Game(palette=...)` accepts 32 NES color indices:
+those slots, shared across boxes. Backgrounds default to palette 0 and can choose
+one of four palettes per 16×16 pixel region using `map(..., palette=...)`.
+Sprites choose one of four sprite palettes. `Game(palette=...)` accepts 32 NES color indices:
 16 background entries, then 16 sprite entries. Entries 16/20/24/28 must match
 their hardware mirrors 0/4/8/12.
 
@@ -194,12 +211,12 @@ Actors have independent runtime variables `x`, `y`, `vx`, `vy`, `grounded`,
 actual screen pixels: actor `y=80` displays at pixel 80. The renderer performs
 the OAM Y conversion. Original `game.sprite()` coordinates remain raw OAM bytes.
 
-Velocity is signed integer pixels per gameplay tick, limited to −8…8. With an
+For an integer actor, velocity is signed integer pixels per gameplay tick, limited to −8…8. With an
 expression, `Velocity` clamps signed values to that range and unsigned values
 to 0…8. An omitted component preserves its current velocity. Gravity adds
 0…4 pixels/tick to vertical velocity before movement, capped by
 `max_fall_speed` (1…8). For example, gravity 1 and jump velocity −8 reach a peak
-28 pixels above the starting position. There is no fractional-pixel physics yet.
+28 pixels above the starting position. Existing integer actors retain this behavior.
 
 Movement sweeps one pixel at a time and checks every tile covered by the hitbox,
 so movement cannot tunnel through a solid tile. Walls and ceilings stop the
@@ -232,6 +249,69 @@ then `after_physics` events, then animation/rendering. Use `after_physics` for
 collection and win rules that should see this tick's final positions. Event
 conditions read live RAM; earlier actions can affect later conditions in the same
 tick. Changes made after physics are processed by collision on the next tick.
+
+### Fractional motion and platformer controls
+
+Fractional gravity or terminal speed automatically enables subpixel movement;
+`subpixel=True` also enables it explicitly. The runtime keeps 1/256-pixel
+remainders while the renderer displays whole pixels. Low downward speed keeps
+accumulating, so `max_fall_speed=0.25` moves one pixel every four ticks.
+
+```python
+player = game.actor(tile=PLAYER_TILE, x=40, y=160, gravity=0.25,
+                    max_fall_speed=5, subpixel=True)
+game.platformer(player, speed=2.25, acceleration=0.25, friction=0.375,
+                jump_speed=5.5, jump_cut=2,
+                buffer_frames=5, coyote_frames=4)
+```
+
+`platformer` is a Python factory for explicit events, available on both `Game`
+and `Room`. Left/right approach the target speed; releasing direction approaches
+zero using friction. Opposite directions cancel. Pressing A requests a jump;
+holding A permits a higher jump and releasing it limits upward speed. A press
+just before landing is remembered for `buffer_frames` additional ticks. The
+`coyote_frames` window allows a jump shortly after walking off a ledge, while
+a successful jump consumes that opportunity and prevents double jumping.
+
+Use `left=...`, `right=...`, and `jump=...` to change buttons. An optional
+`enabled=~won` condition disables the controls, stops horizontal movement, and
+cancels pending jumps. `animate=False` leaves animation management to your own
+rules. The helper uses two events and returns them; call it once per actor,
+before custom movement rules that should override it.
+
+The constituent actions can also be used directly:
+
+```python
+from py3nes import ApproachVelocity, ButtonDown, CutJump, Jump
+
+game.bind_held(Button.RIGHT, ApproachVelocity(player, vx=2.25, acceleration=0.25))
+game.bind_pressed(Button.A, Jump(player, speed=5.5, buffer_frames=5, coyote_frames=4))
+game.every_frame(If(~ButtonDown(Button.A), CutJump(player, max_rise_speed=2)))
+```
+
+Choose the helper or install your own complete controls. `ButtonDown` is a
+runtime condition that can be combined with flags and other conditions.
+`ApproachVelocity` supports `vx` and/or `vy` targets, approaching without
+overshoot; approaching zero implements friction. `Jump` handles grounding and
+buffering itself, so its pressed event should not be gated on `grounded`.
+`CutJump` leaves downward or already slower upward motion unchanged.
+
+Motion literals must be finite multiples of `1/256`: `0.25`, `0.375`, and
+`1 / 256` are valid, while `0.1` produces a precision error. Velocity remains
+limited to −8…8, gravity to 0…4, and terminal speed to 1/256…8. Acceleration is
+positive and at most 8; jump speed is positive and at most 8. Buffer/coyote
+windows are 0…254 ticks. These values are converted to integers during the
+Python build; the cartridge uses no floating-point interpreter.
+
+For debugging, subpixel actors add `x_fraction`, `y_fraction`, `vx_fraction`,
+and `vy_fraction` bytes. A complete value is its existing integer byte plus
+the corresponding fraction divided by 256. Signed integer bytes use floor:
+velocity −0.25 is `vx=-1`, `vx_fraction=192`. Ordinary byte expressions and
+`Set(actor.vx, ...)` still operate on the integer byte; use `Velocity` to assign
+a complete velocity. A whole-pixel expression passed to `Velocity` clears that
+component's fraction. Teleport and room entry clear fractional state and queued
+jumps; collisions clear the affected remainder so actors do not creep through
+walls. Integer and subpixel actors can share the same room.
 
 ## 3. Changing text, counters, and background tiles
 
@@ -400,6 +480,138 @@ With named rooms, place visual content and actors on the rooms; mixing root
 `game.text`/`map`/`actor`/`sprite` content with named rooms raises an error.
 Root variables and global event rules remain useful in a room-based game.
 
+## 6. PNG artwork and background palettes
+
+Install the image extra, then draw an indexed PNG in a pixel-art editor. Image
+dimensions must be multiples of 8 pixels, without tile spacing or margins.
+PNG palette indexes 0–3 become NES pixel values directly; palette index 0 is
+normally the transparent entry. Fully transparent pixels always map to zero.
+
+```sh
+python -m pip install -e '.[images]'
+```
+
+```python
+from py3nes import Game, load_png
+
+game = Game()
+sheet = load_png("examples/assets/adventure/tiles.png")
+brick = game.tile(sheet.tile(0, 0))
+standing = game.metasprite(sheet.region(0, 1, 2, 2), palette=0)
+walking = game.metasprite(sheet.region(2, 1, 2, 2), palette=0)
+player = game.actor(frames=[standing, walking], x=40, y=208, gravity=1)
+game.map([[brick] * 32] * 2, row=28, solid=True, palette=1)
+```
+
+`load_png` returns an immutable `TileSheet`. Its `width` and `height` are in tiles;
+`tile(column, row)` selects one `Tile`, and `region(column, row, width, height)`
+selects a rectangular grid for `game.metasprite`. `sheet.tiles` exposes the full
+grid. To use a region as a background, register its cells with `game.tile` and
+pass their tile indices to `game.map`. Loading does not allocate graphics in a
+game; registration deduplicates identical tiles and checks the existing budget.
+
+RGB/RGBA PNGs require an explicit mapping in pixel-value order:
+
+```python
+sheet = load_png("art/player.png",
+                 colors=["#00000000", "#ECEEEC", "#4C9AEC", "#A84000"])
+```
+
+Supply one to four RGB/RGBA tuples or `#RRGGBB`/`#RRGGBBAA` strings. Opaque pixel
+colors must match exactly. Partial transparency, extra colors, and animated PNGs
+raise errors; arrange animation frames in a sheet. No color quantization or
+antialiasing is applied. With indexed PNGs, the preview RGB palette does not
+change pixel indexes. With either format, final NES colors still come from
+`Game(palette=...)`; loading an image does not replace the cartridge palette.
+See [the bundled artwork layout](examples/assets/adventure/ART.md).
+
+`game.map(..., palette=2)` assigns background subpalette 2 to every tile in a
+patch. A matching grid of integers 0–3, or `Map(..., palettes=grid)`, assigns
+different subpalettes. The final assignments must agree inside every screen-
+aligned 2×2-tile region: this follows the NES's
+[16×16 pixel attribute granularity](https://www.nesdev.org/wiki/PPU_attribute_tables).
+Conflicts report the affected region at build time. Later explicit assignments
+replace earlier ones at the same cells; omitting `palette` preserves underlying
+assignments, allowing text to inherit a surrounding region's palette.
+The current display-update actions change tile numbers, leaving these attributes
+unchanged. Each room has independent background palette assignments while all
+rooms share the cartridge's palette colors.
+
+## 7. Visual room design with Tiled
+
+[Tiled](https://www.mapeditor.org/) can author background tiles, collision, actor
+placements, entrances, and exit regions. Save maps as JSON (`.tmj`) with **finite,
+orthogonal, 8×8-pixel tiles** and at most **32 columns × 30 rows**. Use uncompressed
+JSON arrays for tile-layer data. An external JSON tileset (`.tsj`) or inline
+tileset must reference a PNG sheet with no spacing or margin. Paths resolve
+relative to the file containing the reference, independent of the build's
+working directory. The importer follows Tiled's
+[JSON map and tileset format](https://doc.mapeditor.org/en/stable/reference/json-map-format/).
+
+Use ordinary tile layers for backgrounds. Later nonempty cells replace earlier
+ones; empty cells leave earlier graphics visible. A tile layer named `collision`
+(case insensitive), or with a Boolean custom property `collision=true`, marks
+every nonempty cell solid. Collision layers remain active when hidden in the
+editor. Other hidden layers and objects are skipped. Collision is independent
+of visible tiles, so platforms need cells in both layers when appropriate.
+
+An integer custom property `palette` selects background subpalette 0–3. It can
+appear on a tileset, tile layer, or individual tile definition, with precedence
+**tile definition, layer, tileset**. The default is 0. Occupied cells in each
+16×16 pixel region must agree; empty cells inherit that region's selection.
+Horizontal and vertical tile flips are baked into the imported graphics and
+deduplicated. Diagonal flips, tile animation, image collections, tile collision
+objects, infinite maps, group/image layers, opacity, tint, and layer offsets are
+currently rejected.
+
+Place named points or axis-aligned rectangles on object layers. Coordinates are
+whole screen pixels, and names/classes are ASCII identifiers. In Tiled's object
+properties, set **Class** (older exports call this `type`):
+
+| Class | Interpretation | Required custom properties |
+| --- | --- | --- |
+| `player`, `key`, or another application class | Calls the corresponding Python actor factory | Whatever that factory requires |
+| `spawn` | Names an actor's entrance position | String `actor`: actor object name |
+| `exit` | Names a rectangular destination region | String `room`; optional string `spawn` |
+
+Actor factories run once during the Python build and receive `(room, object)`.
+They must construct and return an actor using the object's `name`, `x`, and `y`.
+The object's immutable `properties` mapping exposes scalar custom properties;
+its rectangle dimensions can inform a factory's hitbox if desired. No Python
+code is embedded in the map. For a map containing an object of class `player`:
+
+```python
+def make_player(room, obj):
+    return room.actor(name=obj.name, frames=[standing, walking],
+                      x=obj.x, y=obj.y, gravity=1)
+
+hall = game.room("hall")
+imported = hall.import_tiled("levels/hall.tmj",
+                             actor_factories={"player": make_player})
+player = imported.actors["player"]
+game.start(hall, spawn="start")  # A spawn object named start, actor="player".
+```
+
+The returned `ImportedRoom` exposes `actors`, `spawns`, and `exits` by object
+name. For inspection without modifying a game, `load_tiled(path, colors=None)`
+returns an immutable `TiledMap`; call its `apply(room, actor_factories=...)` to
+construct the content. The `colors` option has the same meaning as `load_png`.
+Failed imports restore builder state, including tile allocation and actors.
+
+Import all rooms before connecting exits:
+
+```python
+imported.bind_exits(player, {"hall": hall, "garden": garden})
+```
+
+This creates `Button.UP` press rules that change rooms while the player overlaps
+each exit rectangle. Pass `button=Button.A` to choose another button. Destination
+rooms and optional spawns are validated before adding rules. For locked doors,
+write a conditional rule using `imported.exits["tower_door"].contains(player)`
+and `ChangeRoom(...)` instead of automatically binding that room's exits.
+Keep inventory, conditions, and gameplay rules in Python while editing room
+geometry and placements in Tiled.
+
 ## Assembly and command-line builds
 
 ```python
@@ -485,6 +697,8 @@ python examples/keys_and_platforms.py
 node tools/platformer_smoke.mjs
 python examples/three_rooms.py
 node tools/rooms_smoke.mjs
+python -m py3nes examples/visual_adventure.py -o build/visual_adventure.nes
+node tools/visual_adventure_smoke.mjs
 ```
 
 This checks rendered text and controller behavior, then saves initial and moved
@@ -493,6 +707,8 @@ level with controller inputs and verifies collection, victory, and restart.
 The rooms check tries the locked tower, collects the garden key, revisits the
 garden to verify persistence, wins in the tower, and starts a new game. It saves
 screenshots of the hall, collected key, unlocked hall, and victory.
+The visual-adventure check also verifies imported PNG graphics, per-room
+background palettes, fractional movement, and the full edited-map adventure.
 Node is needed only for these extra checks.
 
 Licensed under MIT. The bundled font and example graphics are original.

@@ -1,13 +1,26 @@
 """Screen-space actors and explicit physics/animation descriptions.
 
 Coordinates are pixels; unlike raw Sprite OAM coordinates, actor Y is the actual
-visible top edge. Velocity is a signed integer number of pixels per game tick.
+visible top edge. Subpixel actors use signed 8.8 fixed-point velocity internally.
 """
 
 from dataclasses import dataclass, field
+import math
 
 from .ir import ActionSpec, Condition, Expr, Variable, as_expr
 from .model import integer
+
+
+def fixed(value, name, minimum=-8, maximum=8):
+    """Validate an exact 1/256-pixel literal and return its signed fixed value."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be an int or float")
+    if not minimum <= value <= maximum or not math.isfinite(value):
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    scaled = value * 256
+    if scaled != int(scaled):
+        raise ValueError(f"{name} must be a multiple of 1/256 pixel")
+    return int(scaled)
 
 
 @dataclass(frozen=True)
@@ -69,10 +82,11 @@ class Actor:
     initial_x: int
     initial_y: int
     hitbox: Hitbox = field(default_factory=Hitbox)
-    gravity: int = 0
-    max_fall_speed: int = 4
+    gravity: int | float = 0
+    max_fall_speed: int | float = 4
     frame_ticks: int = 8
     collides: bool = True
+    subpixel: bool = False
     x: Variable = field(init=False)
     y: Variable = field(init=False)
     vx: Variable = field(init=False)
@@ -82,6 +96,15 @@ class Actor:
     animation_enabled: Variable = field(init=False)
     frame: Variable = field(init=False)
     frame_timer: Variable = field(init=False)
+    x_fraction: Variable | None = field(init=False, default=None)
+    y_fraction: Variable | None = field(init=False, default=None)
+    vx_fraction: Variable | None = field(init=False, default=None)
+    vy_fraction: Variable | None = field(init=False, default=None)
+    jump_buffer: Variable | None = field(init=False, default=None)
+    jump_speed: Variable | None = field(init=False, default=None)
+    jump_fraction: Variable | None = field(init=False, default=None)
+    jump_coyote: Variable | None = field(init=False, default=None)
+    air_frames: Variable | None = field(init=False, default=None)
 
     def __post_init__(self):
         integer(self.index, "actor index", 0, 127)
@@ -98,8 +121,14 @@ class Actor:
             raise ValueError("actor sprite parts exceed the 64 hardware sprite slots")
         integer(self.initial_x, "actor x", 0, 256 - self.width)
         integer(self.initial_y, "actor y", 1, 240 - self.height)
-        integer(self.gravity, "gravity", 0, 4)
-        integer(self.max_fall_speed, "max_fall_speed", 1, 8)
+        if not isinstance(self.subpixel, bool):
+            raise TypeError("subpixel must be a bool")
+        fixed(self.gravity, "gravity", 0, 4)
+        fixed(self.max_fall_speed, "max_fall_speed", 1 / 256, 8)
+        if isinstance(self.gravity, float) or isinstance(self.max_fall_speed, float):
+            object.__setattr__(self, "subpixel", True)
+        if not self.subpixel:
+            integer(self.max_fall_speed, "max_fall_speed", 1, 8)
         integer(self.frame_ticks, "frame_ticks", 1, 255)
         if not isinstance(self.collides, bool):
             raise TypeError("collides must be a bool")
@@ -111,11 +140,20 @@ class Actor:
             ("frame_timer", 0, "u8"),
         ):
             object.__setattr__(self, key, Variable(f"actor_{self.index}_{key}", value, kind))
+        if self.subpixel:
+            for key in self._motion_keys:
+                value = 255 if key == "air_frames" else 0
+                kind = "i8" if key == "jump_speed" else "u8"
+                object.__setattr__(self, key, Variable(f"actor_{self.index}_{key}", value, kind))
+
+    _motion_keys = ("x_fraction", "y_fraction", "vx_fraction", "vy_fraction",
+                    "jump_buffer", "jump_speed", "jump_fraction", "jump_coyote", "air_frames")
 
     @property
     def variables(self):
-        return (self.x, self.y, self.vx, self.vy, self.grounded, self.visible,
-                self.animation_enabled, self.frame, self.frame_timer)
+        basic = (self.x, self.y, self.vx, self.vy, self.grounded, self.visible,
+                 self.animation_enabled, self.frame, self.frame_timer)
+        return basic + tuple(getattr(self, key) for key in self._motion_keys) if self.subpixel else basic
 
     @property
     def oam_slots(self):
@@ -140,8 +178,8 @@ def _actor(value):
 @dataclass(frozen=True)
 class Velocity(ActionSpec):
     actor: Actor
-    vx: int | Expr | None = None
-    vy: int | Expr | None = None
+    vx: int | float | Expr | None = None
+    vy: int | float | Expr | None = None
 
     def __post_init__(self):
         _actor(self.actor)
@@ -150,10 +188,67 @@ class Velocity(ActionSpec):
         for key in ("vx", "vy"):
             value = getattr(self, key)
             if value is not None:
-                if isinstance(value, int):
-                    integer(value, key, -8, 8)
+                if isinstance(value, (int, float)):
+                    if self.actor.subpixel:
+                        fixed(value, key)
+                    else:
+                        integer(value, key, -8, 8)
                 else:
                     as_expr(value)
+
+
+def _subpixel_actor(actor):
+    _actor(actor)
+    if not actor.subpixel:
+        raise ValueError("this action requires an actor with subpixel=True or fractional gravity")
+
+
+@dataclass(frozen=True)
+class ApproachVelocity(ActionSpec):
+    """Move velocity toward a target by at most acceleration each game tick.
+
+    A zero target provides friction; a nonzero target provides acceleration.
+    Register this action every frame or bind it to a held direction.
+    """
+    actor: Actor
+    vx: int | float | None = None
+    vy: int | float | None = None
+    acceleration: int | float = 0.25
+
+    def __post_init__(self):
+        _subpixel_actor(self.actor)
+        if self.vx is None and self.vy is None:
+            raise ValueError("ApproachVelocity needs vx and/or vy")
+        for key in ("vx", "vy"):
+            if getattr(self, key) is not None:
+                fixed(getattr(self, key), key)
+        fixed(self.acceleration, "acceleration", 1 / 256, 8)
+
+
+@dataclass(frozen=True)
+class Jump(ActionSpec):
+    """Request a jump, retaining an early press for buffer_frames extra ticks."""
+    actor: Actor
+    speed: int | float = 4.5
+    buffer_frames: int = 4
+    coyote_frames: int = 4
+
+    def __post_init__(self):
+        _subpixel_actor(self.actor)
+        fixed(self.speed, "jump speed", 1 / 256, 8)
+        integer(self.buffer_frames, "buffer_frames", 0, 254)
+        integer(self.coyote_frames, "coyote_frames", 0, 254)
+
+
+@dataclass(frozen=True)
+class CutJump(ActionSpec):
+    """Limit upward speed when the jump button is released, leaving falls alone."""
+    actor: Actor
+    max_rise_speed: int | float = 2
+
+    def __post_init__(self):
+        _subpixel_actor(self.actor)
+        fixed(self.max_rise_speed, "max_rise_speed", 0, 8)
 
 
 @dataclass(frozen=True)

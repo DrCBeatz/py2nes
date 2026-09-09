@@ -1,4 +1,4 @@
 include LICENSE README.md
-recursive-include examples *.py
+recursive-include examples *.py *.png *.tmj *.tsj *.md
 recursive-include tests *.py
 recursive-include tools *.mjs

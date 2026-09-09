@@ -7,6 +7,7 @@ advances one pixel at a time, so even an eight-pixel step cannot cross a wall.
 from textwrap import dedent
 
 from .physics import Actor, Animate, Hide, Overlaps, Show, Teleport, Velocity
+from .motion_codegen import MotionRuntime
 
 
 def _lines(source):
@@ -34,6 +35,7 @@ class PhysicsRuntime:
         self.render = []
         self.routines = []
         self.rodata = []
+        self.motion = None
         if not self.actors:
             return
         for name in ("x", "y", "vx", "vy", "grounded", "offx", "offy", "w", "h",
@@ -47,10 +49,14 @@ class PhysicsRuntime:
         if self.rooms:
             # The room loader changes this pointer while rendering is disabled.
             compiler.reserve("phys_collision_base", size=2, zp=True)
+        if any(actor.subpixel for actor in self.actors):
+            self.motion = MotionRuntime(self)
         self.init = ["    jsr physics_initial_ground", "    jsr render_actors_initial"]
         self.update = ["    jsr physics_update"]
         self.render = ["    jsr render_actors"]
         self.routines = self._dispatch() + self._common() + self._render()
+        if self.motion:
+            self.routines += self.motion.routines()
         if self.rooms:
             for index, room in enumerate(self.rooms):
                 collision = room.collision_data()
@@ -88,9 +94,11 @@ class PhysicsRuntime:
         for key, value in (("offx", actor.hitbox.offset_x), ("offy", actor.hitbox.offset_y),
                 ("w", actor.hitbox.width), ("h", actor.hitbox.height),
                 ("maxx", 256 - actor.width), ("maxy", 240 - actor.height),
-                ("gravity", actor.gravity), ("fall", actor.max_fall_speed),
+                ("gravity", int(actor.gravity)), ("fall", int(actor.max_fall_speed)),
                 ("solid", int(actor.collides))):
             lines += [f"    lda #${value:02X}", f"    sta phys_{key}"]
+        if actor.subpixel:
+            lines += self.motion.state_in(actor)
         return lines
 
     def _dispatch(self):
@@ -101,9 +109,13 @@ class PhysicsRuntime:
             lines += self._active_room(actor, skip)
             lines += [f"    lda {self._var(actor, 'visible')}", f"    bne {active}",
                       f"    jmp {skip}", f"{active}:"]
-            lines += self._state_in(actor) + ["    jsr physics_tick"]
+            if actor.subpixel:
+                lines += self.motion.jump_attempt(actor)
+            lines += self._state_in(actor) + ["    jsr motion_tick" if actor.subpixel else "    jsr physics_tick"]
             for key in ("x", "y", "vx", "vy", "grounded"):
                 lines += [f"    lda phys_{key}", f"    sta {self._var(actor, key)}"]
+            if actor.subpixel:
+                lines += self.motion.state_out(actor) + self.motion.after_tick(actor)
             lines += [f"{skip}:"]
         lines += ["    rts", "physics_initial_ground:"]
         for actor in self.actors:
@@ -111,11 +123,19 @@ class PhysicsRuntime:
             lines += self._active_room(actor, skip)
             lines += self._state_in(actor) + ["    jsr physics_support", "    lda phys_grounded",
                                               f"    sta {self._var(actor, 'grounded')}"]
+            if actor.subpixel:
+                airborne = self.compiler.unique("initial_actor_airborne")
+                lines += [f"    beq {airborne}", "    lda #0",
+                          f"    sta {self._var(actor, 'air_frames')}", f"{airborne}:"]
             if skip is not None:
                 lines += [f"{skip}:"]
         return lines + ["    rts"]
 
     def emit_action(self, action):
+        if self.motion:
+            lines = self.motion.emit_action(action)
+            if lines is not None:
+                return lines
         if not isinstance(action, (Velocity, Teleport, Show, Hide, Animate)):
             return None
         actor = action.actor
@@ -134,10 +154,16 @@ class PhysicsRuntime:
                     lines += [f"    sta {self._var(actor, key)}"]
             return lines
         if isinstance(action, Teleport):
-            return [f"    lda #${action.x:02X}", f"    sta {self._var(actor, 'x')}",
+            lines = [f"    lda #${action.x:02X}", f"    sta {self._var(actor, 'x')}",
                     f"    lda #${action.y:02X}", f"    sta {self._var(actor, 'y')}",
                     "    lda #$00", f"    sta {self._var(actor, 'vx')}",
                     f"    sta {self._var(actor, 'vy')}", f"    sta {self._var(actor, 'grounded')}"]
+            if actor.subpixel:
+                for key in actor._motion_keys:
+                    if key != "air_frames":
+                        lines += [f"    sta {self._var(actor, key)}"]
+                lines += ["    lda #255", f"    sta {self._var(actor, 'air_frames')}"]
+            return lines
         if isinstance(action, Animate):
             return [f"    lda #{int(action.enabled)}", f"    sta {self._var(actor, 'animation_enabled')}"]
         return [f"    lda #{int(isinstance(action, Show))}", f"    sta {self._var(actor, 'visible')}"]
@@ -475,4 +501,9 @@ class PhysicsRuntime:
                 lda phys_ptr+1
                 adc phys_collision_base+1
                 sta phys_ptr+1''')
+        if self.motion:
+            source = source.replace("physics_horizontal_stop:\n                lda #0",
+                                    "physics_horizontal_stop:\n                lda #1\n                sta motion_hitx\n                lda #0")
+            source = source.replace("physics_vertical_stop:\n                lda #0",
+                                    "physics_vertical_stop:\n                lda #1\n                sta motion_hity\n                lda #0")
         return _lines(source)

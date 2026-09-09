@@ -105,6 +105,11 @@ class RuntimeCompiler:
         """Fall through on true; absolute-jump on false without branch range limits."""
         if depth > 32:
             raise ValueError("runtime conditions may nest at most 32 levels")
+        from .controls import ButtonDown
+        if isinstance(condition, ButtonDown):
+            passed = self.unique("button_down")
+            return ["    lda controller_held", f"    and #${int(condition.button):02X}",
+                    f"    bne {passed}", f"    jmp {false_label}", f"{passed}:"]
         if isinstance(condition, Compare):
             code = self.load(condition.left)
             if condition.signed: code.append("    eor #$80")

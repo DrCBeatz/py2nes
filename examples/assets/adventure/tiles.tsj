@@ -1,0 +1,15 @@
+{
+  "columns": 8,
+  "image": "tiles.png",
+  "imageheight": 24,
+  "imagewidth": 64,
+  "margin": 0,
+  "name": "Adventure",
+  "spacing": 0,
+  "tilecount": 24,
+  "tileheight": 8,
+  "tilewidth": 8,
+  "type": "tileset",
+  "version": "1.10",
+  "tiledversion": "1.11.2"
+}
