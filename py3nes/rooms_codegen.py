@@ -62,9 +62,7 @@ class RoomsRuntime:
                  "    lda #0", "    sta rt_room_loading", "    rts",
                  "room_load:", "    lda rt_room_next", "    sta rt_room",
                  "    lda #0", "    sta rt_room_pending", *fx.begin_frame]
-        if fx.audio:
-            lines += ["    lda #0", "    sta APUSTATUS",
-                      f"    sta {fx.sound_pending}", f"    sta {fx.sound_remaining}"]
+        lines += fx.room_reset
         for room in self.rooms:
             index = room.index
             next_room = c.unique("load_next_room")

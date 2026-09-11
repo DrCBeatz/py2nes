@@ -1,0 +1,81 @@
+name: Tests and example ROMs
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.13']
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install compiler and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cc65
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]' build
+      - name: Require CPU and image integration tools
+        run: |
+          python - <<'PY'
+          import shutil
+          from py65.devices.mpu6502 import MPU
+          from PIL import Image
+
+          missing = [tool for tool in ('ca65', 'ld65') if not shutil.which(tool)]
+          if missing:
+              raise SystemExit('Missing required integration tools: ' + ', '.join(missing))
+          print('cc65, py65, and Pillow are available; integration tests must run.')
+          PY
+      - name: Run unit and 6502 runtime tests
+        run: python -m unittest discover -s tests -v
+      - name: Build every example ROM
+        run: python tools/check_examples.py
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: matrix.python == '3.13'
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Run complete-emulator checks
+        if: matrix.python == '3.13'
+        run: |
+          npm install --prefix build/emulator --no-audit --no-fund jsnes@2.1.0 pngjs@7.0.0
+          python tools/check_examples.py --smoke-only
+      - name: Build wheel and source distribution
+        if: matrix.python == '3.13'
+        run: python -m build
+      - name: Save ROMs, debug symbols, screenshots, and packages
+        if: always() && matrix.python == '3.13'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: example-roms-and-packages
+          retention-days: 14
+          path: |
+            build/*.nes
+            build/*.s
+            build/*.cfg
+            build/*.lbl
+            build/*.map
+            build/*.png
+            dist/*.whl
+            dist/*.tar.gz

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "py3nes"
-version = "0.4.0"
+version = "0.5.0"
 description = "Describe small NES games in Python and compile them to 6502 assembly and NROM ROMs."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,3 +25,6 @@ py3nes = "py3nes.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["py3nes*"]
+
+[tool.setuptools.package-data]
+py3nes = ["vendor/famistudio/*.s", "vendor/famistudio/LICENSE", "vendor/famistudio/*.md", "vendor/famistudio/NoteTables/*.bin"]

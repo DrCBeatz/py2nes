@@ -1,4 +1,4 @@
-"""Descriptions for background updates and the NES's first pulse channel."""
+"""Descriptions for background updates and pulse-channel sound effects."""
 
 from dataclasses import dataclass
 
@@ -101,14 +101,35 @@ class Tone:
 
 
 @dataclass(frozen=True)
+class SoundEffect:
+    """A sequence of pulse tones with changing pitch, volume and duty.
+
+    Durations are video frames. Greater priorities replace lower priorities;
+    equal priorities replace one another. A plain Tone has priority zero.
+    With music, the FamiStudio mixer shares pulse 1 according to volume: keep
+    effects louder than the music's pulse 1 to make them prominent.
+    """
+
+    tones: tuple[Tone, ...]
+    priority: int = 0
+
+    def __post_init__(self):
+        tones = tuple(self.tones)
+        if not 1 <= len(tones) <= 64 or not all(isinstance(tone, Tone) for tone in tones):
+            raise ValueError("SoundEffect requires 1..64 Tone steps")
+        object.__setattr__(self, "tones", tones)
+        integer(self.priority, "priority", 0, 255)
+
+
+@dataclass(frozen=True)
 class PlaySound(ActionSpec):
     """Start a tone at the next committed video frame, replacing pulse 1."""
 
-    tone: Tone
+    tone: Tone | SoundEffect
 
     def __post_init__(self) -> None:
-        if not isinstance(self.tone, Tone):
-            raise TypeError("PlaySound requires a Tone description")
+        if not isinstance(self.tone, (Tone, SoundEffect)):
+            raise TypeError("PlaySound requires a Tone or SoundEffect description")
 
 
 @dataclass(frozen=True)

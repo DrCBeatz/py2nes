@@ -63,6 +63,20 @@ Open `build/visual_adventure.nes` in your emulator. Edit the
 Controls and room goals follow the three-room adventure above. Gameplay rules
 remain in [visual_adventure.py](examples/visual_adventure.py).
 
+For actors with named animations, a patrolling guard, damage and checkpoint
+respawning, interactive dialogue choices, and FamiStudio music:
+
+```sh
+python -m py3nes examples/living_adventure.py -o build/living_adventure.nes
+```
+
+Open `build/living_adventure.nes`. Walk near the green guide and press **B** to
+talk; **A** advances dialogue and **Up/Down** selects an answer. In the garden,
+**B** attacks the guard on contact. Collecting the key activates a checkpoint.
+The tower ends with a timed message sequence and a victory tune. The example
+uses portable music data, so building it does not require FamiStudio. See the
+[gameplay and music guide](docs/gameplay.md) for the v0.5 APIs and how to edit music.
+
 ```python
 from py3nes import Button, Game, Move, Tile
 
@@ -374,7 +388,9 @@ pulse sound. Frequency is quantized to a valid hardware timer; volume is 0–15,
 duration 1–255 video frames, and duty 0–3. `PlaySound(tone)` replaces the current
 sound on pulse channel 1; `StopSound()` silences it. Sound commands commit at the
 next ready frame, and durations advance every video frame even if graphics or
-physics delay gameplay. There is no music sequencer or multi-channel mixer yet.
+physics delay gameplay. `SoundEffect` adds tone sequences with priority;
+`PlayMusic` uses the bundled FamiStudio engine for multi-channel music. See the
+[music guide](docs/gameplay.md#famistudio-music-and-sound-effects) for their interaction.
 The implementation follows NESdev's [pulse-channel register reference](https://www.nesdev.org/wiki/APU_Pulse).
 
 ## 5. Rooms, entrances, and state lifetime
@@ -675,9 +691,18 @@ The linker configuration follows the [ld65 documentation](https://cc65.github.io
 
 ## Development
 
+GitHub Actions runs the tests and builds every Python example on Python 3.10 and
+3.13 for each push and pull request. It installs cc65, py65, and Pillow explicitly
+so CPU and image integration tests cannot silently skip because tools are absent.
+The optional test that launches an installed FamiStudio editor may skip; the
+portable music assets and audio runtime tests still run. The Python 3.13 job also
+runs all five JSNES checks and builds the wheel and source distribution. Download
+ROMs, debug symbols, screenshots, and packages from the workflow's artifacts.
+
 ```sh
 python -m pip install -e '.[test]'
 python -m unittest discover -s tests -v
+python tools/check_examples.py
 ```
 
 The tests check description validation and graphics encoding, compile ROMs with
@@ -699,6 +724,8 @@ python examples/three_rooms.py
 node tools/rooms_smoke.mjs
 python -m py3nes examples/visual_adventure.py -o build/visual_adventure.nes
 node tools/visual_adventure_smoke.mjs
+python -m py3nes examples/living_adventure.py -o build/living_adventure.nes
+node tools/living_adventure_smoke.mjs
 ```
 
 This checks rendered text and controller behavior, then saves initial and moved
@@ -709,6 +736,11 @@ garden to verify persistence, wins in the tower, and starts a new game. It saves
 screenshots of the hall, collected key, unlocked hall, and victory.
 The visual-adventure check also verifies imported PNG graphics, per-room
 background palettes, fractional movement, and the full edited-map adventure.
+The living-adventure check exercises dialogue choices and frozen input, guard
+damage and respawning, checkpoint activation, persistent inventory, the timed
+ending, and music playback through a complete emulator.
 Node is needed only for these extra checks.
 
-Licensed under MIT. The bundled font and example graphics are original.
+Licensed under MIT. The bundled font, example graphics, and example music are
+original. The bundled FamiStudio engine retains its upstream MIT license and
+[attribution](py3nes/vendor/famistudio/NOTICE.md).

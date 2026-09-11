@@ -1,6 +1,7 @@
 """Public builder API. All Python code runs before the ROM is started."""
 
 from dataclasses import fields, is_dataclass, replace
+from collections.abc import Mapping
 from pathlib import Path
 import textwrap
 from typing import Sequence
@@ -10,7 +11,7 @@ from .build import BuildResult, compile_rom, emit_assembly
 from .model import (Action, Button, Event, Map, SetTile,
                     Sprite, TextBox, Trigger, integer)
 from .ir import Variable
-from .physics import Actor, Hitbox, Metasprite, SpritePart
+from .physics import Actor, AnimationClip, AnimationRange, Hitbox, Metasprite, SpritePart
 from .effects import SetBackgroundTile
 
 
@@ -183,22 +184,38 @@ class Game:
             del self._tiles[before:]
             raise
 
-    def actor(self, *, tile=None, frames=None, name=None, x=0, y=1,
+    def actor(self, *, tile=None, frames=None, animations=None, name=None, x=0, y=1,
               hitbox=None, gravity=0, max_fall_speed=4, frame_ticks=8, collides=True,
-              subpixel=False) -> Actor:
+              subpixel=False, facing=None, freezable=False) -> Actor:
         """Create an actor with screen coordinates, velocity, collision and animation."""
         if len(self._actors) >= 8:
             raise ValueError("maximum 8 actors per room" if self is not self._root else "maximum 8 actors per game")
-        if (tile is None) == (frames is None):
-            raise ValueError("provide either tile or frames for an actor")
+        if sum(value is not None for value in (tile, frames, animations)) != 1:
+            raise ValueError("provide either tile or frames or animations for an actor")
         if name is None:
             name = f"actor{len(self._actors)}"
         if any(a.name == name for a in self._actors):
             raise ValueError(f"duplicate actor name: {name}")
         before = len(self._tiles)
         try:
+            clips = []
+            inputs = (tile,) if frames is None else frames
+            if animations is not None:
+                if not isinstance(animations, Mapping) or not animations:
+                    raise ValueError("animations must be a nonempty mapping of names to AnimationClip descriptions")
+                inputs = []
+                for clip_name, clip in animations.items():
+                    if not isinstance(clip, AnimationClip):
+                        raise TypeError("animations values must be AnimationClip descriptions")
+                    clips.append(AnimationRange(clip_name, len(inputs), len(clip.frames),
+                                                clip.frame_ticks, clip.loop))
+                    inputs.extend(clip.frames)
+                if len(inputs) > 32:
+                    raise ValueError("actor animations may contain at most 32 frames in total")
+                if facing is None:
+                    facing = "right"
             graphics = []
-            for graphic in ((tile,) if frames is None else frames):
+            for graphic in inputs:
                 if not isinstance(graphic, Metasprite):
                     index = self.tile(graphic) if isinstance(graphic, Tile) else self._tile_index(graphic)
                     graphic = Metasprite((SpritePart(index),))
@@ -212,7 +229,8 @@ class Game:
                                 max(p.dy + 8 for g in graphics for p in g.parts))
             actor = Actor(self._actor_index(), name, tuple(graphics), self._oam_used,
                           x, y, hitbox, gravity, max_fall_speed, frame_ticks, collides,
-                          subpixel=subpixel)
+                          subpixel=subpixel, clips=tuple(clips), facing=facing,
+                          freezable=freezable)
             if self._oam_used + actor.oam_slots > 64:
                 raise ValueError("actors and sprites together may use at most 64 OAM slots")
         except (TypeError, ValueError):
@@ -251,6 +269,41 @@ class Game:
         """Bind movement, acceleration, friction, buffered jumping and jump release."""
         from .controls import platformer
         return platformer(self, actor, **options)
+
+    def timer(self, name, **options):
+        """Create a saturating countdown that advances in gameplay ticks."""
+        from .behaviors import timer
+        return timer(self, name, **options)
+
+    def state_machine(self, name, **options):
+        """Build named runtime states with entry actions and conditional transitions."""
+        from .behaviors import state_machine
+        return state_machine(self, name, **options)
+
+    def patrol(self, actor, **options):
+        """Give an actor a reusable horizontal patrol behavior."""
+        from .behaviors import patrol
+        return patrol(self, actor, **options)
+
+    def health(self, actor, **options):
+        """Attach health and a temporary damage cooldown to an actor."""
+        from .behaviors import health
+        return health(self, actor, **options)
+
+    def checkpoint(self, actor, **options):
+        """Describe named respawn positions for an actor."""
+        from .behaviors import checkpoint
+        return checkpoint(self, actor, **options)
+
+    def sequence(self, name, *steps, **options):
+        """Build an explicit sequence of actions and waits across gameplay ticks."""
+        from .sequences import sequence
+        return sequence(self, name, *steps, **options)
+
+    def dialogue(self, name, pages, **options):
+        """Reserve a text area and build a paged, interactive conversation."""
+        from .dialogue import dialogue
+        return dialogue(self, name, pages, **options)
 
     def text(self, text: str, *, column: int = 0, row: int = 0) -> TextBox:
         """Place uppercase text, with explicit newlines and no automatic wrapping."""

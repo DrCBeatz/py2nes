@@ -106,9 +106,11 @@ class RuntimeCompiler:
         if depth > 32:
             raise ValueError("runtime conditions may nest at most 32 levels")
         from .controls import ButtonDown
-        if isinstance(condition, ButtonDown):
-            passed = self.unique("button_down")
-            return ["    lda controller_held", f"    and #${int(condition.button):02X}",
+        from .sequences import ButtonPressed
+        if isinstance(condition, (ButtonDown, ButtonPressed)):
+            state = "controller_pressed" if isinstance(condition, ButtonPressed) else "controller_held"
+            passed = self.unique("button_test")
+            return [f"    lda {state}", f"    and #${int(condition.button):02X}",
                     f"    bne {passed}", f"    jmp {false_label}", f"{passed}:"]
         if isinstance(condition, Compare):
             code = self.load(condition.left)

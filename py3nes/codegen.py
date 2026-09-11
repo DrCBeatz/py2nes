@@ -336,6 +336,7 @@ def generate_assembly(
             "    lda #$00",
             "    sta PPUSCROLL",
             "    sta PPUSCROLL",
+            *effects.nmi_tail,
             "nmi_restore:",
             "    pla",
             "    tay",

@@ -6,7 +6,8 @@ leaves headroom for OAM DMA within NTSC vertical blank. Large batches keep
 frame_ready set until drained, applying backpressure instead of losing writes.
 """
 
-from .effects import PlaySound, SetBackgroundTile, StopSound, WriteNumber, WriteText
+from .effects import PlaySound, SetBackgroundTile, SoundEffect, StopSound, WriteNumber, WriteText
+from .music import PauseMusic, PlayMusic, StopMusic
 
 
 MAX_TILE_WRITES = 64
@@ -19,12 +20,15 @@ class EffectsRuntime:
         actions = tuple(actions)
         self.display = any(isinstance(a, (WriteText, WriteNumber, SetBackgroundTile)) for a in actions)
         self.numbers = any(isinstance(a, WriteNumber) for a in actions)
-        self.audio = any(isinstance(a, (PlaySound, StopSound)) for a in actions)
+        self.audio = any(isinstance(a, (PlaySound, StopSound, PlayMusic)) for a in actions)
+        self.audio_runtime = None
         self.init = []
         self.begin_frame = []
         self.update = []
         self.nmi_always = []
         self.nmi = []
+        self.nmi_tail = []
+        self.room_reset = []
         self.routines = []
         self.rodata = []
         self.queue_length = None
@@ -38,7 +42,24 @@ class EffectsRuntime:
         if self.numbers:
             self.digits = compiler.reserve("fx_digits", 3)
             self.routines += self._digits_routine()
-        if self.audio:
+        if any(isinstance(a, PlayMusic) for a in actions):
+            from .music_codegen import MusicRuntime
+            self.audio_runtime = MusicRuntime(compiler, actions)
+            self.init += self.audio_runtime.init
+            self.nmi += self.audio_runtime.nmi_commit
+            self.nmi_tail += self.audio_runtime.nmi_tail
+            self.routines += self.audio_runtime.routines
+            self.rodata += self.audio_runtime.rodata
+            self.room_reset += self.audio_runtime.room_reset
+        elif any(isinstance(a, PlaySound) and isinstance(a.tone, SoundEffect) for a in actions):
+            from .sound_codegen import PulseSequenceRuntime
+            self.audio_runtime = PulseSequenceRuntime(compiler, actions)
+            self.nmi_always += self.audio_runtime.nmi_always
+            self.nmi[:0] = self.audio_runtime.nmi
+            self.routines += self.audio_runtime.routines
+            self.rodata += self.audio_runtime.rodata
+            self.room_reset += self.audio_runtime.room_reset
+        elif self.audio:
             for name in ("pending", "control", "low", "high", "frames", "remaining"):
                 setattr(self, f"sound_{name}", compiler.reserve(f"fx_sound_{name}"))
             # This countdown is safe even when main is interrupted while
@@ -46,8 +67,16 @@ class EffectsRuntime:
             self.nmi_always += ["    jsr fx_tick_sound"]
             self.nmi[:0] = ["    jsr fx_commit_sound"]
             self.routines += self._audio_routines()
+            self.room_reset += ["    lda #0", "    sta APUSTATUS",
+                                f"    sta {self.sound_pending}", f"    sta {self.sound_remaining}"]
 
     def emit_action(self, action):
+        if self.audio_runtime:
+            result = self.audio_runtime.emit_action(action)
+            if result is not None:
+                return result
+        if isinstance(action, (PauseMusic, StopMusic)):
+            return []  # No PlayMusic anywhere in the game: already silent.
         if isinstance(action, WriteText):
             return self._text(action)
         if isinstance(action, WriteNumber):

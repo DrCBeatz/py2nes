@@ -73,6 +73,42 @@ class Metasprite:
         object.__setattr__(self, "parts", parts)
 
 
+@dataclass(frozen=True)
+class AnimationClip:
+    """Named animation input; Game.actor registers its tiles at build time."""
+    frames: tuple
+    frame_ticks: int = 8
+    loop: bool = True
+
+    def __post_init__(self):
+        frames = tuple(self.frames)
+        if not frames or len(frames) > 32:
+            raise ValueError("animation clip needs between 1 and 32 frames")
+        integer(self.frame_ticks, "animation frame_ticks", 1, 255)
+        if not isinstance(self.loop, bool):
+            raise TypeError("animation loop must be a bool")
+        object.__setattr__(self, "frames", frames)
+
+
+@dataclass(frozen=True)
+class AnimationRange:
+    """Registered clip within an actor's flattened frame list."""
+    name: str
+    start: int
+    count: int
+    frame_ticks: int = 8
+    loop: bool = True
+
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not self.name.isidentifier() or not self.name.isascii():
+            raise ValueError("animation name must be an ASCII identifier")
+        integer(self.start, "animation start", 0, 31)
+        integer(self.count, "animation count", 1, 32)
+        integer(self.frame_ticks, "animation frame_ticks", 1, 255)
+        if not isinstance(self.loop, bool):
+            raise TypeError("animation loop must be a bool")
+
+
 @dataclass(frozen=True, eq=False)
 class Actor:
     index: int
@@ -87,6 +123,9 @@ class Actor:
     frame_ticks: int = 8
     collides: bool = True
     subpixel: bool = False
+    clips: tuple[AnimationRange, ...] = ()
+    facing: str | None = None
+    freezable: bool = False
     x: Variable = field(init=False)
     y: Variable = field(init=False)
     vx: Variable = field(init=False)
@@ -105,6 +144,9 @@ class Actor:
     jump_fraction: Variable | None = field(init=False, default=None)
     jump_coyote: Variable | None = field(init=False, default=None)
     air_frames: Variable | None = field(init=False, default=None)
+    clip: Variable | None = field(init=False, default=None)
+    facing_left: Variable | None = field(init=False, default=None)
+    frozen: Variable | None = field(init=False, default=None)
 
     def __post_init__(self):
         integer(self.index, "actor index", 0, 127)
@@ -114,6 +156,18 @@ class Actor:
         if not frames or len(frames) > 32 or not all(isinstance(f, Metasprite) for f in frames):
             raise ValueError("actor frames must contain between 1 and 32 Metasprites")
         object.__setattr__(self, "frames", frames)
+        clips = tuple(self.clips)
+        if any(not isinstance(clip, AnimationRange) for clip in clips):
+            raise TypeError("actor clips must contain registered AnimationRanges")
+        if len({clip.name for clip in clips}) != len(clips):
+            raise ValueError("actor animation names must be unique")
+        if clips and (clips[0].start != 0 or any(clip.start + clip.count > len(frames) for clip in clips)):
+            raise ValueError("actor animation ranges must fit its frames and start at zero")
+        object.__setattr__(self, "clips", clips)
+        if self.facing not in (None, "left", "right"):
+            raise ValueError("actor facing must be None, 'left', or 'right'")
+        if not isinstance(self.freezable, bool):
+            raise TypeError("actor freezable must be a bool")
         if not isinstance(self.hitbox, Hitbox):
             raise TypeError("actor hitbox must be a Hitbox")
         integer(self.oam_start, "actor OAM start", 0, 63)
@@ -145,6 +199,13 @@ class Actor:
                 value = 255 if key == "air_frames" else 0
                 kind = "i8" if key == "jump_speed" else "u8"
                 object.__setattr__(self, key, Variable(f"actor_{self.index}_{key}", value, kind))
+        for key, enabled, initial, kind in (
+            ("clip", bool(clips), 0, "u8"),
+            ("facing_left", self.facing is not None, int(self.facing == "left"), "flag"),
+            ("frozen", self.freezable, 0, "flag"),
+        ):
+            if enabled:
+                object.__setattr__(self, key, Variable(f"actor_{self.index}_{key}", initial, kind))
 
     _motion_keys = ("x_fraction", "y_fraction", "vx_fraction", "vy_fraction",
                     "jump_buffer", "jump_speed", "jump_fraction", "jump_coyote", "air_frames")
@@ -153,7 +214,10 @@ class Actor:
     def variables(self):
         basic = (self.x, self.y, self.vx, self.vy, self.grounded, self.visible,
                  self.animation_enabled, self.frame, self.frame_timer)
-        return basic + tuple(getattr(self, key) for key in self._motion_keys) if self.subpixel else basic
+        motion = tuple(getattr(self, key) for key in self._motion_keys) if self.subpixel else ()
+        optional = tuple(getattr(self, key) for key in ("clip", "facing_left", "frozen")
+                         if getattr(self, key) is not None)
+        return basic + motion + optional
 
     @property
     def oam_slots(self):
@@ -288,6 +352,48 @@ class Animate(ActionSpec):
         _actor(self.actor)
         if not isinstance(self.enabled, bool):
             raise TypeError("animation enabled must be a bool")
+
+
+@dataclass(frozen=True)
+class PlayAnimation(ActionSpec):
+    """Select a clip; selecting the current clip preserves its playback position."""
+    actor: Actor
+    name: str
+    restart: bool = False
+
+    def __post_init__(self):
+        _actor(self.actor)
+        if not any(clip.name == self.name for clip in self.actor.clips):
+            raise ValueError(f"actor has no animation named {self.name!r}")
+        if not isinstance(self.restart, bool):
+            raise TypeError("animation restart must be a bool")
+
+
+@dataclass(frozen=True)
+class Face(ActionSpec):
+    actor: Actor
+    direction: str
+
+    def __post_init__(self):
+        _actor(self.actor)
+        if self.actor.facing_left is None:
+            raise ValueError("Face requires an actor with facing='left' or facing='right'")
+        if self.direction not in ("left", "right"):
+            raise ValueError("facing direction must be 'left' or 'right'")
+
+
+@dataclass(frozen=True)
+class Freeze(ActionSpec):
+    """Pause physics and animation, preserving velocity and the visible graphic."""
+    actor: Actor
+    frozen: bool = True
+
+    def __post_init__(self):
+        _actor(self.actor)
+        if self.actor.frozen is None:
+            raise ValueError("Freeze requires an actor with freezable=True")
+        if not isinstance(self.frozen, bool):
+            raise TypeError("frozen must be a bool")
 
 
 @dataclass(frozen=True, eq=False)

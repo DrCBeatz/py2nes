@@ -6,7 +6,8 @@ advances one pixel at a time, so even an eight-pixel step cannot cross a wall.
 
 from textwrap import dedent
 
-from .physics import Actor, Animate, Hide, Overlaps, Show, Teleport, Velocity
+from .physics import (Actor, Animate, Face, Freeze, Hide, Overlaps, PlayAnimation,
+                      Show, Teleport, Velocity)
 from .motion_codegen import MotionRuntime
 
 
@@ -109,6 +110,10 @@ class PhysicsRuntime:
             lines += self._active_room(actor, skip)
             lines += [f"    lda {self._var(actor, 'visible')}", f"    bne {active}",
                       f"    jmp {skip}", f"{active}:"]
+            if actor.frozen is not None:
+                thawed = self.compiler.unique("physics_thawed")
+                lines += [f"    lda {self._var(actor, 'frozen')}", f"    beq {thawed}",
+                          f"    jmp {skip}", f"{thawed}:"]
             if actor.subpixel:
                 lines += self.motion.jump_attempt(actor)
             lines += self._state_in(actor) + ["    jsr motion_tick" if actor.subpixel else "    jsr physics_tick"]
@@ -136,10 +141,26 @@ class PhysicsRuntime:
             lines = self.motion.emit_action(action)
             if lines is not None:
                 return lines
-        if not isinstance(action, (Velocity, Teleport, Show, Hide, Animate)):
+        if not isinstance(action, (Velocity, Teleport, Show, Hide, Animate, Face, Freeze, PlayAnimation)):
             return None
         actor = action.actor
         self._var(actor, "x")  # Validate game ownership even for an empty update.
+        if isinstance(action, Face):
+            return [f"    lda #{int(action.direction == 'left')}", f"    sta {self._var(actor, 'facing_left')}"]
+        if isinstance(action, Freeze):
+            return [f"    lda #{int(action.frozen)}", f"    sta {self._var(actor, 'frozen')}"]
+        if isinstance(action, PlayAnimation):
+            index, clip = next((i, clip) for i, clip in enumerate(actor.clips) if clip.name == action.name)
+            done = self.compiler.unique("play_animation_done")
+            lines = []
+            if not action.restart:
+                lines += [f"    lda {self._var(actor, 'clip')}", f"    cmp #{index}", f"    beq {done}"]
+            return lines + [f"    lda #{index}", f"    sta {self._var(actor, 'clip')}",
+                            f"    lda #{clip.start}", f"    sta {self._var(actor, 'frame')}",
+                            # The render tick wraps this to zero, displaying the
+                            # newly selected first frame for a full tick even at 1.
+                            "    lda #255", f"    sta {self._var(actor, 'frame_timer')}",
+                            "    lda #1", f"    sta {self._var(actor, 'animation_enabled')}", f"{done}:"]
         if isinstance(action, Velocity):
             lines = []
             for key in ("vx", "vy"):
@@ -202,8 +223,14 @@ class PhysicsRuntime:
                 continue
             skip = self.compiler.unique("animation_skip")
             lines += self._active_room(actor, skip)
+            if actor.clips:
+                lines += self._clip_tick(actor, skip) + [f"{skip}:"]
+                continue
             lines += [f"    lda {self._var(actor, 'visible')}", f"    beq {skip}",
-                      f"    lda {self._var(actor, 'animation_enabled')}", f"    beq {skip}",
+                      f"    lda {self._var(actor, 'animation_enabled')}", f"    beq {skip}"]
+            if actor.frozen is not None:
+                lines += [f"    lda {self._var(actor, 'frozen')}", f"    bne {skip}"]
+            lines += [
                       f"    inc {self._var(actor, 'frame_timer')}",
                       f"    lda {self._var(actor, 'frame_timer')}", f"    cmp #{actor.frame_ticks}",
                       f"    bcc {skip}", "    lda #0", f"    sta {self._var(actor, 'frame_timer')}",
@@ -234,17 +261,60 @@ class PhysicsRuntime:
                     base = 0x200 + (actor.oam_start + index) * 4
                     # A raw Set may have changed coordinates after physics. Clip
                     # whole sprite parts so arithmetic never wraps onto screen.
-                    lines += [f"    lda {self._var(actor, 'x')}", "    clc", f"    adc #{part.dx}",
+                    if actor.facing_left is not None:
+                        normal = self.compiler.unique("render_part_normal")
+                        positioned = self.compiler.unique("render_part_positioned")
+                        lines += [f"    lda {self._var(actor, 'facing_left')}", f"    beq {normal}",
+                                  f"    lda {self._var(actor, 'x')}", "    clc", f"    adc #{actor.width - 8 - part.dx}",
+                                  f"    jmp {positioned}", f"{normal}:",
+                                  f"    lda {self._var(actor, 'x')}", "    clc", f"    adc #{part.dx}", f"{positioned}:"]
+                    else:
+                        lines += [f"    lda {self._var(actor, 'x')}", "    clc", f"    adc #{part.dx}"]
+                    lines += [
                               f"    bcs {skip}", "    cmp #249", f"    bcs {skip}",
                               f"    sta ${base + 3:04X}", f"    lda {self._var(actor, 'y')}",
                               "    clc", f"    adc #{part.dy}", f"    bcs {skip}", f"    beq {skip}",
                               "    cmp #233", f"    bcs {skip}", "    sec", "    sbc #1",
                               f"    sta ${base:04X}", f"    lda #${part.tile:02X}",
-                              f"    sta ${base + 1:04X}", f"    lda #${part.attributes:02X}",
-                              f"    sta ${base + 2:04X}", f"{skip}:"]
+                              f"    sta ${base + 1:04X}"]
+                    if actor.facing_left is not None:
+                        # XOR preserves the part's original horizontal flip.
+                        lines += [f"    lda {self._var(actor, 'facing_left')}"] + ["    asl a"] * 6
+                        lines += [f"    eor #${part.attributes:02X}"]
+                    else:
+                        lines += [f"    lda #${part.attributes:02X}"]
+                    lines += [f"    sta ${base + 2:04X}", f"{skip}:"]
                 lines += [f"    jmp {end}"]
             lines += [f"{end}:"]
         return lines + ["    rts"]
+
+    def _clip_tick(self, actor, skip):
+        lines = []
+        checks = [("visible", "bne"), ("animation_enabled", "bne")]
+        if actor.frozen is not None:
+            checks.append(("frozen", "beq"))
+        for key, instruction in checks:
+            allowed = self.compiler.unique("clip_tick_allowed")
+            lines += [f"    lda {self._var(actor, key)}", f"    {instruction} {allowed}",
+                      f"    jmp {skip}", f"{allowed}:"]
+        for index, clip in enumerate(actor.clips):
+            next_clip = self.compiler.unique("clip_tick_next")
+            lines += [f"    lda {self._var(actor, 'clip')}", f"    cmp #{index}", f"    bne {next_clip}"]
+            if clip.count > 1:
+                advance = self.compiler.unique("clip_advance")
+                reset = self.compiler.unique("clip_reset")
+                lines += [f"    inc {self._var(actor, 'frame_timer')}",
+                          f"    lda {self._var(actor, 'frame_timer')}", f"    cmp #{clip.frame_ticks}",
+                          f"    bcs {advance}", f"    jmp {skip}", f"{advance}:",
+                          "    lda #0", f"    sta {self._var(actor, 'frame_timer')}",
+                          f"    inc {self._var(actor, 'frame')}", f"    lda {self._var(actor, 'frame')}",
+                          f"    cmp #{clip.start + clip.count}", f"    bcs {reset}", f"    jmp {skip}",
+                          f"{reset}:", f"    lda #{clip.start if clip.loop else clip.start + clip.count - 1}",
+                          f"    sta {self._var(actor, 'frame')}"]
+                if not clip.loop:
+                    lines += ["    lda #0", f"    sta {self._var(actor, 'animation_enabled')}"]
+            lines += [f"    jmp {skip}", f"{next_clip}:"]
+        return lines
 
     def _common(self):
         source = '''

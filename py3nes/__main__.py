@@ -7,6 +7,7 @@ import sys
 
 from .build import BuildError
 from .game import Game
+from .music import MusicExportError
 from . import __version__
 
 
@@ -31,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
             print(game.emit_assembly(output))
         else:
             print(game.build(output).rom_path)
-    except (BuildError, OSError, ValueError, TypeError) as error:
+    except (BuildError, MusicExportError, OSError, ValueError, TypeError) as error:
         print(f"py3nes: {error}", file=sys.stderr)
         return 1
     finally:
