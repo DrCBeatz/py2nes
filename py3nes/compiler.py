@@ -6,9 +6,11 @@ from .ir import Add, Binary, Compare, Constant, If, Logical, Set, Variable, as_e
 
 
 class RuntimeCompiler:
-    def __init__(self, variables=(), actors=(), collision=bytes(960), events=(), post_events=(), rooms=()):
+    def __init__(self, variables=(), actors=(), collision=bytes(960), events=(), post_events=(), rooms=(),
+                 modes=(), start_mode=0):
         self.variables = tuple(variables)
         self.rooms = tuple(rooms)
+        self.modes = tuple(modes)
         self._names = {}
         self._symbols = set()
         self._sequence = 0
@@ -19,6 +21,7 @@ class RuntimeCompiler:
         self.init = []
         self.physics = None
         self.effects = None
+        self.mode_runtime = None
         self.expr_rhs = self.reserve("rt_expr_rhs", zp=True)
         if self.rooms:
             for name in ("room", "room_next", "room_spawn", "room_pending", "room_loading"):
@@ -27,6 +30,10 @@ class RuntimeCompiler:
             label = self.reserve("v_" + variable.name)
             self._names[id(variable)] = label
             self.init += [f"    lda #${variable.initial & 255:02X}", f"    sta {label}"]
+        if self.modes:
+            from .modes_codegen import ModesRuntime
+            self.mode_runtime = ModesRuntime(self, self.modes, start_mode)
+            self.init += self.mode_runtime.prepare_init
         if actors:
             from .physics_codegen import PhysicsRuntime
             self.physics = PhysicsRuntime(self, actors, collision, rooms=self.rooms)
@@ -34,26 +41,66 @@ class RuntimeCompiler:
                 self.init += self.physics.init
         room_events = tuple(e for room in self.rooms
                             for e in (*room.events, *room.post_events, *room.enter_events))
-        actions = tuple(walk_actions(a for event in (*events, *post_events, *room_events) for a in event.actions))
+        mode_events = tuple(e for mode in self.modes for e in mode.enter_events)
+        actions = tuple(walk_actions(a for event in (*events, *post_events, *room_events, *mode_events) for a in event.actions))
         # Keep the state-only compiler independently usable as the runtime grows.
         from .effects import write_count
         from .effects_codegen import EffectsRuntime
         self.effects = EffectsRuntime(self, actions)
         self.init += self.effects.init
-        global_cost = sum(self.action_costs(event.actions, write_count) for event in (*events, *post_events))
+        global_events = (*events, *post_events)
+        global_cost = self.event_costs(global_events, write_count)
         costs = [global_cost]
         for room in self.rooms:
-            costs.append(global_cost + sum(self.action_costs(e.actions, write_count)
-                                          for e in (*room.events, *room.post_events)))
+            costs.append(self.event_costs((*global_events, *room.events, *room.post_events), write_count))
             costs.append(sum(self.action_costs(e.actions, write_count) for e in room.enter_events))
+        costs += [sum(self.action_costs(e.actions, write_count) for e in mode.enter_events)
+                  for mode in self.modes]
         if max(costs) > 64:
             raise ValueError(f"events may enqueue {max(costs)} background tile writes per tick or room entry; maximum is 64 (split work across ticks)")
 
+    def event_costs(self, events, leaf_cost):
+        events = tuple(events)
+        if not self.modes:
+            return sum(self.action_costs(event.actions, leaf_cost) for event in events)
+        return max(sum(self.action_costs(event.actions, leaf_cost) for event in events
+                       if event.scope == "always" or event.scope is mode
+                       or ((event.scope is None or event.scope == "gameplay") and mode.gameplay))
+                   for mode in self.modes)
+
     @staticmethod
     def action_costs(actions, leaf_cost):
-        return sum(max(RuntimeCompiler.action_costs(action.actions, leaf_cost),
-                       RuntimeCompiler.action_costs(action.otherwise, leaf_cost))
-                   if isinstance(action, If) else leaf_cost(action) for action in actions)
+        """Maximum writes along a path, stopping at unconditional transitions.
+
+        Ordinary ChangeMode can be a same-mode no-op, so its continuation still
+        counts. Guarded sequence transitions use restart=True to expose their
+        terminal path without counting the sequence finalizer twice.
+        """
+        from .modes import ChangeMode
+        from .rooms import ChangeRoom
+
+        def maximum(*values):
+            values = tuple(value for value in values if value is not None)
+            return max(values) if values else None
+
+        def paths(commands):
+            continuing, terminated = 0, None
+            for action in commands:
+                if continuing is None:
+                    break
+                if isinstance(action, If):
+                    left, right = paths(action.actions), paths(action.otherwise)
+                    advance, stop = maximum(left[0], right[0]), maximum(left[1], right[1])
+                elif isinstance(action, ChangeRoom) or isinstance(action, ChangeMode) and action.restart:
+                    advance, stop = None, 0
+                else:
+                    advance, stop = leaf_cost(action), None
+                if stop is not None:
+                    terminated = maximum(terminated, continuing + stop)
+                continuing = continuing + advance if advance is not None else None
+            return continuing, terminated
+
+        return maximum(*paths(actions)) or 0
 
     def unique(self, prefix="branch"):
         self._sequence += 1
@@ -105,6 +152,10 @@ class RuntimeCompiler:
         """Fall through on true; absolute-jump on false without branch range limits."""
         if depth > 32:
             raise ValueError("runtime conditions may nest at most 32 levels")
+        if self.mode_runtime:
+            result = self.mode_runtime.condition(condition, false_label)
+            if result is not None:
+                return result
         from .controls import ButtonDown
         from .sequences import ButtonPressed
         if isinstance(condition, (ButtonDown, ButtonPressed)):
@@ -141,11 +192,19 @@ class RuntimeCompiler:
             result = self.physics.emit_condition(condition, false_label)
             if result is not None:
                 return result
+        from .combat_codegen import emit_condition
+        result = emit_condition(self, condition, false_label)
+        if result is not None:
+            return result
         raise TypeError(f"unsupported runtime condition: {type(condition).__name__}")
 
     def action(self, action, depth=0):
         if depth > 32:
             raise ValueError("conditional actions may nest at most 32 levels")
+        if self.mode_runtime:
+            result = self.mode_runtime.action(action)
+            if result is not None:
+                return result
         from .rooms import ChangeRoom
         if isinstance(action, ChangeRoom):
             if not any(action.room is room for room in self.rooms):
@@ -174,11 +233,13 @@ class RuntimeCompiler:
         from .codegen import _action_lines
         return _action_lines(action)
 
-    def events(self, events, label):
+    def events(self, events, label, *, scoped=True):
         from .model import Trigger
         code = [f".export {label}", f"{label}:"]
         for event in events:
             done = self.unique("event_done")
+            if self.mode_runtime and scoped:
+                code += self.mode_runtime.scope(event.scope, done)
             if event.trigger is not Trigger.FRAME:
                 state = "controller_held" if event.trigger is Trigger.HELD else "controller_pressed"
                 run = self.unique("event_run")

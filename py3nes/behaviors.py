@@ -192,8 +192,13 @@ class Patrol:
     moving_left: Variable
 
 
-def patrol(game, actor, *, left, right, speed=1, enabled=None, animation=None, name=None):
-    """Move between two top-left X coordinates; solid walls still stop motion."""
+def patrol(game, actor, *, left, right, speed=1, enabled=None, animation=None, name=None,
+           suspended=None):
+    """Move between two top-left X coordinates; solid walls still stop motion.
+
+    ``suspended`` skips steering and endpoint clamping while preserving velocity,
+    for example during a combat recoil. ``enabled=False`` stops horizontal motion.
+    """
     if not isinstance(actor, Actor):
         raise TypeError("patrol needs an Actor")
     game._validate(actor)
@@ -205,6 +210,7 @@ def patrol(game, actor, *, left, right, speed=1, enabled=None, animation=None, n
         raise ValueError("patrol actor must start within its patrol range")
     fixed(speed, "patrol speed", 1 / 256, 8)
     name = _name(actor.name if name is None else name)
+    steering = as_condition(True) if suspended is None else ~as_condition(suspended)
     with _transaction(game):
         result = Patrol(actor, game.flag(f"patrol_{name}_left"))
         # The integer coordinate alone does not mean the left endpoint was
@@ -225,9 +231,14 @@ def patrol(game, actor, *, left, right, speed=1, enabled=None, animation=None, n
         movement = If(active, *actions, otherwise=(Velocity(actor, vx=0),))
         if actor.frozen is not None:
             movement = If(~actor.frozen, movement)
+        if suspended is not None:
+            movement = If(steering, movement)
         game.every_frame(movement)
         reset_fraction = (Set(actor.x_fraction, 0),) if actor.subpixel else ()
-        game.after_physics(If(_condition(enabled, actor),
+        clamping = _condition(enabled, actor)
+        if suspended is not None:
+            clamping = clamping & steering
+        game.after_physics(If(clamping,
                              If(actor.x.ge(right), Set(actor.x, right), *reset_fraction,
                                 Set(result.moving_left, True),
                                 otherwise=(If(at_left, Set(actor.x, left), *reset_fraction,

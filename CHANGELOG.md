@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.0
+
+- Add linked resource reports in Python, the CLI, and portable JSON sidecars.
+- Compress room backgrounds, pack collision flags, and omit unused initial OAM
+  data. The living adventure saves 5,824 program-ROM bytes without additional RAM.
+- Add explicit game modes and scoped menu rules, coherent gameplay pausing, and
+  automatic music pause that preserves the application's manual pause setting.
+- Add directional attack windows, cooldowns, one contact per target per swing,
+  recoil, stun, attack/hurt animation, and movement suspension.
+- Add the polished adventure with title/pause/game-over/victory modes, two-hit
+  guards, three lives, and a complete emulator playthrough.
+
 ## 0.5.0
 
 - Add declarative timers, named state machines, patrols, health with

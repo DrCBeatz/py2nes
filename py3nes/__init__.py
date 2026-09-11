@@ -21,8 +21,11 @@ from .dialogue import Choice, Dialogue
 from .effects import SoundEffect
 from .music import (Music, MusicExportError, PauseMusic, PlayMusic, StopMusic,
                     export_famistudio, load_famistudio)
+from .modes import ChangeMode, GameMode, ModeActive
+from .combat import Attack, AttackOverlaps, Hurtbox
+from .resources import ResourceReport, ResourceUsage, RoomUsage
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 __all__ = ["Action", "BuildError", "BuildResult", "Button", "CHAR_TO_TILE",
            "DEFAULT_PALETTE", "Event", "Game", "Map", "Move", "SetPosition",
            "SetTile", "Sprite", "TextBox", "Tile", "Trigger",
@@ -36,4 +39,6 @@ __all__ = ["Action", "BuildError", "BuildResult", "Button", "CHAR_TO_TILE",
            "Checkpoint", "Health", "Patrol", "State", "StateMachine", "Timer", "Transition",
            "ButtonPressed", "Do", "Sequence", "Wait", "WaitForButton", "WaitUntil",
            "Choice", "Dialogue", "SoundEffect", "Music", "MusicExportError",
-           "PauseMusic", "PlayMusic", "StopMusic", "export_famistudio", "load_famistudio"]
+           "PauseMusic", "PlayMusic", "StopMusic", "export_famistudio", "load_famistudio",
+           "ChangeMode", "GameMode", "ModeActive", "Attack", "AttackOverlaps", "Hurtbox",
+           "ResourceReport", "ResourceUsage", "RoomUsage"]

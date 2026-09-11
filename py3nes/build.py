@@ -1,10 +1,12 @@
 """Invoke the cc65 assembler and linker without a shell."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+
+from .resources import ResourceReport, linked_report
 
 
 class BuildError(RuntimeError):
@@ -18,6 +20,8 @@ class BuildResult:
     config_path: Path
     map_path: Path
     labels_path: Path
+    report: ResourceReport | None = None
+    report_path: Path | None = None
 
 
 def emit_assembly(source: str, config: str, path: str | Path) -> Path:
@@ -31,7 +35,7 @@ def emit_assembly(source: str, config: str, path: str | Path) -> Path:
 
 
 def compile_rom(source: str, config: str, output: str | Path, *,
-                ca65: str = "ca65", ld65: str = "ld65") -> BuildResult:
+                ca65: str = "ca65", ld65: str = "ld65", resources: dict | None = None) -> BuildResult:
     rom = Path(output).expanduser().resolve()
     if rom.suffix.lower() != ".nes":
         raise ValueError("ROM output must use a .nes suffix")
@@ -64,7 +68,15 @@ def compile_rom(source: str, config: str, output: str | Path, *,
                 or data[5] != 1 or data[6:16] != bytes(10)
                 or len(data) != 16 + data[4] * 16384 + 8192):
             raise BuildError("Linker produced an invalid NROM image (16/32 KiB PRG, 8 KiB CHR)")
+        try:
+            report = linked_report(map_file.read_text(encoding="utf-8"), data, resources)
+        except ValueError as error:
+            raise BuildError(f"Could not read resource usage: {error}") from error
+        report_file = temp / "game.report.json"
+        report_file.write_text(report.to_json(), encoding="utf-8")
+        result = replace(result, report=report, report_path=rom.with_suffix(".report.json"))
         map_file.replace(result.map_path)
         labels.replace(result.labels_path)
+        report_file.replace(result.report_path)
         binary.replace(rom)
     return result

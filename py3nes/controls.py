@@ -20,7 +20,7 @@ class ButtonDown(Condition):
 def platformer(game, actor, *, speed=2, acceleration=0.25, friction=0.25,
                jump_speed=5.5, jump_cut=2, buffer_frames=4, coyote_frames=4,
                left=Button.LEFT, right=Button.RIGHT, jump=Button.A,
-               enabled=None, animate=True):
+               enabled=None, animate=True, suspended=None):
     """Build explicit rules for a subpixel actor; Python runs only at build time.
 
     Opposite directions cancel. Releasing direction applies friction; releasing
@@ -69,6 +69,10 @@ def platformer(game, actor, *, speed=2, acceleration=0.25, friction=0.25,
     if actor.frozen is not None:
         movement = [If(~actor.frozen, *movement)]
         jump_action = If(~actor.frozen, jump_action)
+    if suspended is not None:
+        resumed = ~as_condition(suspended)
+        movement = [If(resumed, *movement)]
+        jump_action = If(resumed, jump_action)
     events = (Event(Trigger.FRAME, tuple(movement)), Event(Trigger.PRESSED, (jump_action,), jump))
     # Invalid settings cannot leave half a controller setup in the game.
     for event in events:
@@ -85,10 +89,13 @@ def platformer(game, actor, *, speed=2, acceleration=0.25, friction=0.25,
         active = as_condition(True if enabled is None else enabled) & actor.visible
         if actor.frozen is not None:
             active = active & ~actor.frozen
+        if suspended is not None:
+            active = active & ~as_condition(suspended)
         post_event = Event(Trigger.FRAME, (If(active, selection),))
         game._validate(post_event)
     registered = tuple(game.add_event(event) for event in events)
     if post_event is not None:
+        post_event = game._scoped_event(post_event)
         game._post_events.append(post_event)
         registered += (post_event,)
     return registered

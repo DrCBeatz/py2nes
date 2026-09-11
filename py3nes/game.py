@@ -47,6 +47,61 @@ class Game:
         self._rooms = []
         self._start_room = None
         self._start_spawn = None
+        self._modes = []
+        self._start_mode = None
+        self._event_scope = None
+
+    @property
+    def modes(self):
+        """Registered scheduler modes (empty preserves the original runtime)."""
+        return tuple(self._modes)
+
+    def mode(self, name, *, gameplay=False, pause_music=False):
+        """Create a global mode; ordinary gameplay runs only if gameplay=True."""
+        from .modes import GameMode
+        if self is not self._root:
+            raise ValueError("modes belong to the game; call game.mode()")
+        if any(mode.name == name for mode in self.modes):
+            raise ValueError(f"duplicate mode name: {name}")
+        if len(self.modes) >= 16:
+            raise ValueError("maximum 16 game modes")
+        result = GameMode(self, name, len(self.modes), gameplay=gameplay, pause_music=pause_music)
+        self._modes.append(result)
+        return result
+
+    def start_mode(self, mode):
+        """Choose the initial mode; defaults to the first registered mode."""
+        from .modes import GameMode
+        if self is not self._root:
+            raise ValueError("choose the initial mode with game.start_mode()")
+        if not isinstance(mode, GameMode):
+            raise TypeError("start_mode needs a GameMode from game.mode()")
+        self._validate(mode)
+        self._start_mode = mode
+        return mode
+
+    def during(self, scope):
+        """Scope all rules/helpers built in this context to a mode or 'always'."""
+        from .modes import during
+        return during(self, scope)
+
+    def attack(self, actor, **options):
+        """Describe a directional attack with active frames and a cooldown."""
+        from .combat import attack
+        return attack(self, actor, **options)
+
+    def hurtbox(self, health, **options):
+        """Attach attack damage, knockback and hit feedback to actor health."""
+        from .combat import hurtbox
+        return hurtbox(self, health, **options)
+
+    @property
+    def _current_event_scope(self):
+        return (self._event_scope if self._event_scope is not None or self is self._root
+                else self._root._event_scope)
+
+    def _scoped_event(self, event):
+        return replace(event, scope=self._current_event_scope) if event.scope is None else event
 
     @property
     def rooms(self):
@@ -372,6 +427,7 @@ class Game:
         """Register an explicit event and check that all targets belong to this game."""
         if not isinstance(event, Event):
             raise TypeError("event must be an Event description")
+        event = self._scoped_event(event)
         self._validate(event)
         self._events.append(event)
         return event
@@ -379,9 +435,13 @@ class Game:
     def _validate(self, value, depth=0):
         """Validate every branch and nested expression, even currently false branches."""
         from .rooms import ChangeRoom
+        from .modes import GameMode
         if depth > 192:
             raise ValueError("runtime description is nested too deeply (maximum 32 expression/action levels)")
-        if isinstance(value, ChangeRoom):
+        if isinstance(value, GameMode):
+            if value._game is not self._root or not any(value is mode for mode in self._root.modes):
+                raise ValueError("mode belongs to a different game or was not registered")
+        elif isinstance(value, ChangeRoom):
             if value.room.parent is not self._root or not any(value.room is room for room in self._root.rooms):
                 raise ValueError("ChangeRoom destination belongs to a different game or was not registered")
         elif isinstance(value, Variable):
@@ -402,21 +462,21 @@ class Game:
         elif isinstance(value, (tuple, list)):
             for item in value: self._validate(item, depth + 1)
 
-    def bind_held(self, button: Button, *actions: Action) -> Event:
+    def bind_held(self, button: Button, *actions: Action, scope=None) -> Event:
         """Run actions on each game tick while a button is held."""
-        return self.add_event(Event(Trigger.HELD, actions, button))
+        return self.add_event(Event(Trigger.HELD, actions, button, scope))
 
-    def bind_pressed(self, button: Button, *actions: Action) -> Event:
+    def bind_pressed(self, button: Button, *actions: Action, scope=None) -> Event:
         """Run actions once on a button's transition from released to held."""
-        return self.add_event(Event(Trigger.PRESSED, actions, button))
+        return self.add_event(Event(Trigger.PRESSED, actions, button, scope))
 
-    def every_frame(self, *actions: Action) -> Event:
+    def every_frame(self, *actions: Action, scope=None) -> Event:
         """Run actions every game tick, in event registration order."""
-        return self.add_event(Event(Trigger.FRAME, actions))
+        return self.add_event(Event(Trigger.FRAME, actions, scope=scope))
 
-    def after_physics(self, *actions: Action) -> Event:
+    def after_physics(self, *actions: Action, scope=None) -> Event:
         """Evaluate gameplay rules after movement/collision, before rendering this tick."""
-        event = Event(Trigger.FRAME, actions)
+        event = self._scoped_event(Event(Trigger.FRAME, actions, scope=scope))
         self._validate(event)
         self._post_events.append(event)
         return event
@@ -472,7 +532,8 @@ class Game:
                                  palette=self.palette, sprites=self.sprites, events=self.events,
                                  variables=self.variables + tuple(v for room in self.rooms for v in room.variables),
                                  actors=self.actors, collision=self.collision_data(),
-                                 post_events=self.post_events, **room_options)
+                                 post_events=self.post_events, modes=self.modes,
+                                 start_mode=(self._start_mode.index if self._start_mode else 0), **room_options)
 
     def _validate_rooms(self):
         from .ir import walk_actions
@@ -485,6 +546,12 @@ class Game:
         for scope in (self,) + self.rooms:
             for event in scope.events + scope.post_events + getattr(scope, "enter_events", ()):
                 scope._validate(event)
+                for action in walk_actions(event.actions):
+                    if isinstance(action, ChangeRoom):
+                        self._validate_spawn(action.room, action.spawn)
+        for mode in self.modes:
+            for event in mode.enter_events:
+                self._validate(event)
                 for action in walk_actions(event.actions):
                     if isinstance(action, ChangeRoom):
                         self._validate_spawn(action.room, action.spawn)
@@ -502,5 +569,6 @@ class Game:
     def build(self, output: str | Path, *, ca65: str = "ca65", ld65: str = "ld65") -> BuildResult:
         """Generate assembly and invoke ca65/ld65 to produce a .nes cartridge image."""
         from .codegen import LINKER_CONFIG, ROOM_LINKER_CONFIG
+        from .resources import describe_game
         return compile_rom(self.to_assembly(), ROOM_LINKER_CONFIG if self.rooms else LINKER_CONFIG,
-                           output, ca65=ca65, ld65=ld65)
+                           output, ca65=ca65, ld65=ld65, resources=describe_game(self))

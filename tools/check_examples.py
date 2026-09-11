@@ -18,6 +18,7 @@ SMOKE_EXAMPLES = {
     "rooms_smoke.mjs": "three_rooms",
     "visual_adventure_smoke.mjs": "visual_adventure",
     "living_adventure_smoke.mjs": "living_adventure",
+    "polished_adventure_smoke.mjs": "polished_adventure",
 }
 
 

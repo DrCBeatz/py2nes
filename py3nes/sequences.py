@@ -136,7 +136,8 @@ class _Transaction:
                       for name in ("_variables", "_events", "_layers")}
         self.user_names = set(game._user_names) if hasattr(game, "_user_names") else None
         self.modal = {name: getattr(game, name, None) for name in
-                      ("_sequence_modal_busy", "_sequence_modal_handlers", "_sequence_modal_event")}
+                      ("_sequence_modal_busy", "_sequence_modal_handlers", "_sequence_modal_event",
+                       "_sequence_modal_groups")}
 
     def __enter__(self):
         return self
@@ -160,21 +161,44 @@ def _register_handler(game, active, body, modal):
     # Modal ownership makes the handlers mutually exclusive. Keeping that fact
     # visible as one If tree avoids summing the upload budgets of conversations
     # that cannot run together. The first modal helper fixes its event position.
-    handlers = getattr(game, "_sequence_modal_handlers", ()) + ((active, body),)
+    scope = game._current_event_scope
+    scope = "gameplay" if scope is None else scope
+    groups = dict(getattr(game, "_sequence_modal_groups", {}))
+    previous, old_handlers = groups.get(scope, (None, ()))
+    handlers = old_handlers + ((active, body),)
     dispatch = ()
     for owner, commands in reversed(handlers):
         dispatch = (If(owner, *commands, otherwise=dispatch),)
-    event = Event(Trigger.FRAME, dispatch)
+    event = Event(Trigger.FRAME, dispatch, scope=scope)
     game._validate(event)
-    previous = getattr(game, "_sequence_modal_event", None)
     if previous is None:
-        game.add_event(event)
+        event = game.add_event(event)
     else:
         index = next(index for index, candidate in enumerate(game._events) if candidate is previous)
         game._events[index] = event
     game._sequence_modal_handlers = handlers
     game._sequence_modal_event = event
+    groups[scope] = (event, handlers)
+    game._sequence_modal_groups = groups
     return event
+
+
+def _advance_before_mode_change(actions, advance):
+    """A terminal transition must not strand a sequence on its current step."""
+    from .modes import ChangeMode
+    commands = []
+    for action in actions:
+        if isinstance(action, If):
+            commands.append(If(action.condition, *_advance_before_mode_change(action.actions, advance),
+                               otherwise=_advance_before_mode_change(action.otherwise, advance)))
+        elif isinstance(action, ChangeMode):
+            # The guard already excludes no-op transitions. Mark the inner
+            # action unconditional so budget analysis sees its terminal path.
+            commands.append(If(True if action.restart else ~action.mode.active,
+                               *advance, ChangeMode(action.mode, restart=True)))
+        else:
+            commands.append(action)
+    return tuple(commands)
 
 
 def sequence(game, name, *steps, on_start=(), on_finish=(), freeze=()):
@@ -239,7 +263,7 @@ def _sequence(game, name, steps, *, on_start=(), on_finish=(), freeze=(),
             advance = ((Set(pc, index + 1), Set(countdown, 0))
                        if index + 1 < len(steps) else finish)
             if isinstance(step, Do):
-                case = step.actions + advance
+                case = _advance_before_mode_change(step.actions, advance) + advance
             elif isinstance(step, Wait):
                 if step.ticks == 1:
                     case = advance
@@ -252,7 +276,7 @@ def _sequence(game, name, steps, *, on_start=(), on_finish=(), freeze=(),
                              else ButtonPressed(step.button))
                 case = (If(condition, *advance),)
             else:
-                case = step._sequence_case(advance)
+                case = _advance_before_mode_change(step._sequence_case(advance), advance)
             cases.append(case)
         game._validate(start + finish)
         _register_handler(game, active, _dispatch(pc, cases), bool(actors) or modal)

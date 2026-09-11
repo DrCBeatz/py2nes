@@ -85,6 +85,10 @@ class MusicRuntime:
         for name in ("commit", "command", "asset", "song", "restart", "current", "current_song",
                      "sound_pending", "sound_index", "sound_request_priority", "sound_priority"):
             setattr(self, name, compiler.reserve("fx_music_" + name))
+        self.has_modes = bool(compiler.modes)
+        if self.has_modes:
+            self.manual_paused = compiler.reserve("fx_music_manual_paused")
+            self.mode_paused = compiler.reserve("fx_music_mode_paused")
         self.sound_effects = tuple(dict.fromkeys(a.tone for a in actions if isinstance(a, PlaySound)))
         if len(self.sound_effects) > 128:
             raise ValueError("music supports at most 128 distinct sound effects")
@@ -124,14 +128,23 @@ class MusicRuntime:
     def _routines(self):
         # PPU/OAM uploads and scroll restoration precede this entire routine.
         # Main never calls the engine except while NMI is disabled/room-locked.
+        hold_commit = (["    lda rt_mode_pause_music", f"    sta {self.mode_paused}"]
+                       if self.has_modes else [])
+        effective_pause = ([f"    lda {self.manual_paused}", f"    ora {self.mode_paused}",
+                            "    jsr famistudio_music_pause"] if self.has_modes else [])
+        resume = (["    lda #0", f"    sta {self.manual_paused}"] if self.has_modes
+                  else ["    lda #0", "    jsr famistudio_music_pause"])
+        pause = (["    lda #1", f"    sta {self.manual_paused}"] if self.has_modes
+                 else ["    lda #1", "    jsr famistudio_music_pause"])
         return [".export fx_music_frame", "fx_music_frame:", f"    lda {self.commit}",
                 "    beq fx_music_update", "    lda #0", f"    sta {self.commit}",
+                *hold_commit,
                 "    jsr fx_music_commands", "    jsr fx_music_commit_sound",
-                "fx_music_update:", "    jsr famistudio_update", "    rts",
+                "fx_music_update:", *effective_pause, "    jsr famistudio_update", "    rts",
                 "fx_music_commands:", f"    lda {self.command}", "    beq fx_music_commit_done",
                 "    cmp #1", "    beq fx_music_play", "    cmp #2", "    beq fx_music_stop",
-                "    cmp #3", "    beq fx_music_pause", "    lda #0", "    jsr famistudio_music_pause",
-                "    jmp fx_music_committed", "fx_music_pause:", "    lda #1", "    jsr famistudio_music_pause",
+                "    cmp #3", "    beq fx_music_pause", *resume,
+                "    jmp fx_music_committed", "fx_music_pause:", *pause,
                 "    jmp fx_music_committed", "fx_music_stop:", "    jsr famistudio_music_stop",
                 "    lda #255", f"    sta {self.current}", "    jmp fx_music_committed",
                 "fx_music_play:", f"    lda {self.asset}", f"    cmp {self.current}",
@@ -142,7 +155,9 @@ class MusicRuntime:
                 f"    sta {self.current}", "    tax", "    lda fx_music_data_hi,x", "    tay",
                 "    lda fx_music_data_lo,x", "    tax", "    lda #1", "    jsr famistudio_init",
                 # init() resets music/APU but leaves independent SFX initialized.
-                "fx_music_start:", f"    lda {self.song}", f"    sta {self.current_song}",
+                "fx_music_start:",
+                *(["    lda #0", f"    sta {self.manual_paused}"] if self.has_modes else []),
+                f"    lda {self.song}", f"    sta {self.current_song}",
                 "    jsr famistudio_music_play", "fx_music_committed:", "    lda #0",
                 f"    sta {self.command}", "fx_music_commit_done:", "    rts",
                 "fx_music_commit_sound:", f"    lda {self.sound_pending}", "    beq fx_music_sound_done",

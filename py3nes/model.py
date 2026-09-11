@@ -184,8 +184,11 @@ class Event:
     trigger: Trigger
     actions: tuple[Action, ...]
     button: Button | None = None
+    scope: object = None
 
     def __post_init__(self) -> None:
+        from .modes import validate_scope
+        validate_scope(self.scope)
         if not isinstance(self.trigger, Trigger):
             raise TypeError("trigger must be a Trigger")
         actions = tuple(self.actions)

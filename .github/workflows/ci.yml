@@ -76,6 +76,7 @@ jobs:
             build/*.cfg
             build/*.lbl
             build/*.map
+            build/*.report.json
             build/*.png
             dist/*.whl
             dist/*.tar.gz

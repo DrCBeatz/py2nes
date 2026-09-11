@@ -161,9 +161,10 @@ Actor state always resets. Graphics and the cartridge palette belong to Game.
 
     def on_enter(self, *actions: ActionSpec) -> Event:
         """Run once after room state resets and its chosen spawn is applied."""
-        event = Event(Trigger.FRAME, actions)
-        if any(isinstance(action, ChangeRoom) for action in walk_actions(event.actions)):
-            raise ValueError("on_enter cannot contain ChangeRoom; transitions belong in gameplay rules")
+        from .modes import ChangeMode
+        event = Event(Trigger.FRAME, actions, scope="always")
+        if any(isinstance(action, (ChangeRoom, ChangeMode)) for action in walk_actions(event.actions)):
+            raise ValueError("room on_enter cannot contain ChangeRoom or ChangeMode; transitions belong in gameplay rules")
         self._validate(event)
         self._enter_events.append(event)
         return event

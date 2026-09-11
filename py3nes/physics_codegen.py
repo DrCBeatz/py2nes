@@ -68,12 +68,14 @@ class PhysicsRuntime:
             self._collision_table("physics_collision", self.collision)
             for suffix, operator in (("lo", "<"), ("hi", ">")):
                 self.rodata.extend([f"physics_rows_{suffix}:",
-                    "    .byte " + ", ".join(f"{operator}(physics_collision + {row * 32})" for row in range(30))])
+                    "    .byte " + ", ".join(f"{operator}(physics_collision + {row * 4})" for row in range(30))])
+        self.rodata += ["physics_bit_masks:", "    .byte $80, $40, $20, $10, $08, $04, $02, $01"]
 
     def _collision_table(self, label, collision):
+        from .compression import pack_collision
+        from .codegen import _byte_lines
         self.rodata.append(f"{label}:")
-        for offset in range(0, 960, 32):
-            self.rodata.append("    .byte " + ", ".join(str(int(bool(v))) for v in collision[offset:offset + 32]))
+        self.rodata.extend(_byte_lines(pack_collision(collision)))
 
     def _active_room(self, actor, skip):
         """Skip an inactive room with an absolute jump, even for large actors."""
@@ -527,12 +529,28 @@ class PhysicsRuntime:
                 sta phys_ptr
                 lda physics_rows_hi,x
                 sta phys_ptr+1
-                ldy phys_firstcol
+                lda phys_firstcol
+                and #7
+                tax
+                lda physics_bit_masks,x
+                sta phys_col
+                lda phys_firstcol
+                lsr a
+                lsr a
+                lsr a
+                tay
+                ldx phys_firstcol
             physics_collision_column:
                 lda (phys_ptr),y
+                and phys_col
                 bne physics_collision_hit
-                cpy phys_lastcol
+                cpx phys_lastcol
                 beq physics_collision_next_row
+                inx
+                lsr phys_col
+                bne physics_collision_column
+                lda #$80
+                sta phys_col
                 iny
                 jmp physics_collision_column
             physics_collision_next_row:
@@ -553,22 +571,14 @@ class PhysicsRuntime:
                 lda physics_rows_lo,x
                 sta phys_ptr
                 lda physics_rows_hi,x
-                sta phys_ptr+1''', '''                ; Full 16-bit base + row * 32, including page carries.
+                sta phys_ptr+1''', '''                ; Four packed bytes per row; preserve carries from the ROM base.
                 lda phys_row
-                lsr a
-                lsr a
-                lsr a
-                sta phys_ptr+1
-                lda phys_row
-                asl a
-                asl a
-                asl a
                 asl a
                 asl a
                 clc
                 adc phys_collision_base
                 sta phys_ptr
-                lda phys_ptr+1
+                lda #0
                 adc phys_collision_base+1
                 sta phys_ptr+1''')
         if self.motion:

@@ -8,12 +8,15 @@ there is no battery-backed persistence across emulator resets.
 """
 
 from .codegen import _byte_lines
+from .compression import initial_oam, nametable_storage
 
 
 class RoomsRuntime:
     def __init__(self, compiler, rooms, start_room=0, start_spawn=None):
         self.compiler = compiler
         self.rooms = tuple(rooms)
+        self.nametables = {room.index: nametable_storage(room.nametable()) for room in self.rooms}
+        self.oam = {room.index: initial_oam(room.sprites) for room in self.rooms}
         compiler.reserve("rt_room_load_ptr", size=2, zp=True)
         start = self.rooms[start_room]
         spawn = 255 if start_spawn is None else tuple(start.spawns).index(start_spawn)
@@ -22,19 +25,18 @@ class RoomsRuntime:
         self.routines = self._loader()
         self.rodata = []
         for room in self.rooms:
-            self.rodata += [f"room_{room.index}_nametable:", *_byte_lines(room.nametable())]
-            oam = bytearray([255] * 256)
-            for sprite in room.sprites:
-                attributes = (sprite.palette | (int(sprite.behind_background) << 5)
-                              | (int(sprite.flip_horizontal) << 6) | (int(sprite.flip_vertical) << 7))
-                offset = sprite.index * 4
-                oam[offset:offset + 4] = bytes((sprite.y, sprite.tile, attributes, sprite.x))
-            self.rodata += [f"room_{room.index}_oam:", *_byte_lines(oam)]
+            data, compressed = self.nametables[room.index]
+            self.rodata += [f"; {room.name}: nametable {'RLE' if compressed else 'raw'}, {len(data)} bytes",
+                            f"room_{room.index}_nametable:", *_byte_lines(data)]
+            if self.oam[room.index]:
+                self.rodata += [f"room_{room.index}_oam:", *_byte_lines(self.oam[room.index])]
 
     def events(self, global_events, attribute, label):
         compiler = self.compiler
         lines = [f".export {label}", f"{label}:", f"    jsr {label}_global",
-                 "    lda rt_room_pending", f"    beq {label}_dispatch", "    rts",
+                 "    lda rt_room_pending",
+                 *(["    ora rt_mode_pending"] if compiler.mode_runtime else []),
+                 f"    beq {label}_dispatch", "    rts",
                  f"{label}_dispatch:"]
         for room in self.rooms:
             next_room = compiler.unique("dispatch_next")
@@ -70,10 +72,19 @@ class RoomsRuntime:
                       f"    jmp {next_room}", f"room_load_{index}:"]
             lines += [f"    lda #<room_{index}_nametable", "    sta rt_room_load_ptr",
                       f"    lda #>room_{index}_nametable", "    sta rt_room_load_ptr+1",
-                      "    jsr room_copy_nametable"]
-            loop = c.unique("room_oam")
-            lines += ["    ldx #0", f"{loop}:", f"    lda room_{index}_oam,x",
-                      "    sta $0200,x", "    inx", f"    bne {loop}"]
+                      "    jsr room_unpack_nametable" if self.nametables[index][1]
+                      else "    jsr room_copy_nametable"]
+            lines += ["    ldx #0"]
+            prefix_size = len(self.oam[index])
+            if prefix_size:
+                loop = c.unique("room_oam")
+                lines += [f"{loop}:", f"    lda room_{index}_oam,x", "    sta $0200,x", "    inx"]
+                if prefix_size < 256:
+                    lines += [f"    cpx #{prefix_size}"]
+                lines += [f"    bne {loop}"]
+            if prefix_size < 256:
+                clear = c.unique("room_oam_clear")
+                lines += ["    lda #$FF", f"{clear}:", "    sta $0200,x", "    inx", f"    bne {clear}"]
             if c.physics:
                 lines += [f"    lda #<room_{index}_collision", "    sta phys_collision_base",
                           f"    lda #>room_{index}_collision", "    sta phys_collision_base+1"]
@@ -92,12 +103,31 @@ class RoomsRuntime:
             # Rendering is off; fully apply entry writes before showing the room.
             lines += ["room_flush_entry:", "    jsr fx_drain_vram",
                       f"    lda {fx.queue_length}", "    bne room_flush_entry"]
-        lines += ["    rts", "room_copy_nametable:", "    bit PPUSTATUS",
-                  "    lda #$20", "    sta PPUADDR", "    lda #0", "    sta PPUADDR",
-                  "    ldx #4", "    ldy #0", "room_copy_byte:",
-                  "    lda (rt_room_load_ptr),y", "    sta PPUDATA", "    iny",
-                  "    bne room_copy_byte", "    inc rt_room_load_ptr+1", "    dex",
-                  "    bne room_copy_byte", "    rts"]
+        lines += ["    rts"]
+        if any(not compressed for _, compressed in self.nametables.values()):
+            lines += ["room_copy_nametable:", "    bit PPUSTATUS",
+                      "    lda #$20", "    sta PPUADDR", "    lda #0", "    sta PPUADDR",
+                      "    ldx #4", "    ldy #0", "room_copy_byte:",
+                      "    lda (rt_room_load_ptr),y", "    sta PPUDATA", "    iny",
+                      "    bne room_copy_byte", "    inc rt_room_load_ptr+1", "    dex",
+                      "    bne room_copy_byte", "    rts"]
+        if any(compressed for _, compressed in self.nametables.values()):
+            lines += [
+                "; Main owns the PPU during room loading; unpack directly to VRAM.",
+                "room_unpack_nametable:", "    bit PPUSTATUS",
+                "    lda #$20", "    sta PPUADDR", "    lda #0", "    sta PPUADDR", "    tay",
+                "room_unpack_packet:", "    jsr room_unpack_read", "    beq room_unpack_done",
+                "    bmi room_unpack_repeat", "    tax",
+                "room_unpack_literal:", "    jsr room_unpack_read", "    sta PPUDATA", "    dex",
+                "    bne room_unpack_literal", "    jmp room_unpack_packet",
+                "room_unpack_repeat:", "    and #$7F", "    tax", "    inx", "    jsr room_unpack_read",
+                "room_unpack_run:", "    sta PPUDATA", "    dex", "    bne room_unpack_run",
+                "    jmp room_unpack_packet", "room_unpack_done:", "    rts",
+                "; Read one source byte, preserving X/Y and returning A's N/Z flags.",
+                "room_unpack_read:", "    lda (rt_room_load_ptr),y", "    inc rt_room_load_ptr",
+                "    bne room_unpack_read_done", "    inc rt_room_load_ptr+1",
+                "room_unpack_read_done:", "    cmp #0", "    rts",
+            ]
         for room in self.rooms:
-            lines += c.events(room.enter_events, f"room_enter_{room.index}")
+            lines += c.events(room.enter_events, f"room_enter_{room.index}", scoped=False)
         return lines

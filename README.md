@@ -77,6 +77,25 @@ The tower ends with a timed message sequence and a victory tune. The example
 uses portable music data, so building it does not require FamiStudio. See the
 [gameplay and music guide](docs/gameplay.md) for the v0.5 APIs and how to edit music.
 
+The v0.6 example adds title/pause/game-over modes, directional attack windows,
+guard recoil, and three lives:
+
+```sh
+python -m py3nes examples/polished_adventure.py -o build/polished_adventure.nes --report
+```
+
+Open `build/polished_adventure.nes`. **Start** begins, pauses, resumes, or restarts
+after game over/victory; **A** jumps; **B** swings; **Up** talks to the guide or
+enters a door. Swing before touching the guard, and land two hits to defeat it.
+The game also remains completable by jumping over it to collect the key.
+
+The build report lists remaining program ROM, RAM, graphics tiles, and sprite
+slots. It is also saved beside the ROM as `.report.json`. See
+[resource reports](docs/resources.md), [game modes](docs/modes.md), and
+[combat](docs/combat.md) for the new APIs. The existing living adventure now uses
+24,995 program bytes instead of 30,819, with the same RAM allocation, through
+compressed room backgrounds and packed collision data.
+
 ```python
 from py3nes import Button, Game, Move, Tile
 
@@ -696,7 +715,7 @@ GitHub Actions runs the tests and builds every Python example on Python 3.10 and
 so CPU and image integration tests cannot silently skip because tools are absent.
 The optional test that launches an installed FamiStudio editor may skip; the
 portable music assets and audio runtime tests still run. The Python 3.13 job also
-runs all five JSNES checks and builds the wheel and source distribution. Download
+runs all six JSNES checks and builds the wheel and source distribution. Download
 ROMs, debug symbols, screenshots, and packages from the workflow's artifacts.
 
 ```sh
@@ -726,6 +745,8 @@ python -m py3nes examples/visual_adventure.py -o build/visual_adventure.nes
 node tools/visual_adventure_smoke.mjs
 python -m py3nes examples/living_adventure.py -o build/living_adventure.nes
 node tools/living_adventure_smoke.mjs
+python -m py3nes examples/polished_adventure.py -o build/polished_adventure.nes --report
+node tools/polished_adventure_smoke.mjs
 ```
 
 This checks rendered text and controller behavior, then saves initial and moved
@@ -739,6 +760,9 @@ background palettes, fractional movement, and the full edited-map adventure.
 The living-adventure check exercises dialogue choices and frozen input, guard
 damage and respawning, checkpoint activation, persistent inventory, the timed
 ending, and music playback through a complete emulator.
+The polished-adventure check also pauses a midair jump, defeats a guard with two
+separate attacks, verifies recoil, exhausts lives to reach game over, restarts,
+and completes the room adventure and victory sequence.
 Node is needed only for these extra checks.
 
 Licensed under MIT. The bundled font, example graphics, and example music are

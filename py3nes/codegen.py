@@ -85,6 +85,8 @@ def generate_assembly(
     rooms=(),
     start_room=0,
     start_spawn=None,
+    modes=(),
+    start_mode=0,
 ) -> str:
     """Generate self-contained ca65 source with embedded graphics and scene data.
 
@@ -102,7 +104,8 @@ def generate_assembly(
     from .compiler import RuntimeCompiler
     rooms = tuple(rooms)
     actors = tuple(actors) + tuple(actor for room in rooms for actor in room.actors)
-    compiler = RuntimeCompiler(variables, actors, collision, events, post_events, rooms=rooms)
+    compiler = RuntimeCompiler(variables, actors, collision, events, post_events,
+                               rooms=rooms, modes=modes, start_mode=start_mode)
     room_runtime = None
     if rooms:
         from .rooms_codegen import RoomsRuntime
@@ -114,6 +117,32 @@ def generate_assembly(
         event_code = compiler.events(events, "update_events")
         post_code = compiler.events(post_events, "update_post_events")
     effects, physics = compiler.effects, compiler.physics
+    mode_runtime = compiler.mode_runtime
+    mode_code = mode_runtime.routines() if mode_runtime else []
+    if mode_runtime:
+        compiler.init += mode_runtime.init
+        if rooms:
+            compiler.init += ["    lda rt_room_pending", "    beq mode_start_ready",
+                              "    jsr room_load", "mode_start_ready:"]
+        if physics:
+            # Entry may hide/reposition actors after the original scene render.
+            # Resolve support and refresh OAM before the very first DMA.
+            compiler.init += ["    jsr physics_initial_ground", "    jsr render_actors_initial"]
+
+    def mode_pending():
+        return (["    lda rt_mode_pending", "    beq :+", "    jmp main_change_mode", ":"]
+                if mode_runtime else [])
+
+    def gameplay(code, label):
+        if not mode_runtime or not code:
+            return code
+        return ["    lda rt_mode_gameplay", f"    beq {label}", *code, f"{label}:"]
+
+    render = physics.render if physics else []
+    if physics and mode_runtime:
+        render = ["    lda rt_mode_gameplay", "    beq main_render_paused",
+                  *physics.render, "    jmp main_render_done", "main_render_paused:",
+                  "    jsr render_actors_initial", "main_render_done:"]
 
     # Y=$FF hides an unused sprite. Initialize the entire page so DMA is always
     # safe, including before the first gameplay update has run.
@@ -268,16 +297,22 @@ def generate_assembly(
             "    bne main_loop",
             *effects.begin_frame,
             *effects.update,
-            *(physics.before_events if physics else []),
+            *gameplay(physics.before_events if physics else [], "main_before_done"),
             "    jsr read_controller",
             "    jsr update_events",
+            *mode_pending(),
             *(["    lda rt_room_pending", "    bne main_change_room"] if rooms else []),
-            *(physics.update if physics else []),
+            *gameplay(physics.update if physics else [], "main_physics_done"),
             "    jsr update_post_events",
+            *mode_pending(),
             *(["    lda rt_room_pending", "    bne main_change_room"] if rooms else []),
-            *(physics.render if physics else []),
-            *(["    jmp main_publish", "main_change_room:", "    jsr room_transition",
-               "main_publish:"] if rooms else []),
+            *render,
+            *(["    jmp main_publish", "main_change_mode:", "    jsr mode_transition",
+               *(["    lda rt_room_pending", "    bne main_change_room"] if rooms else []),
+               *(["    jsr render_actors_initial"] if physics else []), "    jmp main_publish"]
+              if mode_runtime else []),
+            *(["    jmp main_publish", "main_change_room:", "    jsr room_transition"] if rooms else []),
+            *(["main_publish:"] if rooms or mode_runtime else []),
             "    lda #$01",
             "    sta frame_ready",
             "    jmp main_loop",
@@ -349,6 +384,7 @@ def generate_assembly(
             "    rti",
             *(physics.routines if physics else []),
             *effects.routines,
+            *mode_code,
             *(room_runtime.routines if room_runtime else []),
             "",
             '.segment "RODATA"',
